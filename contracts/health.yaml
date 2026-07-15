@@ -1,0 +1,10 @@
+schema_version: 1
+hard:
+  max_grad_norm_ratio: 3.0
+  max_loss_ratio: 1.5
+  require_finite: true
+  require_checkpoint_hash: true
+  require_provenance: true
+soft:
+  throughput_drop_ratio: 0.10
+  eval_stale_checkpoints: 3

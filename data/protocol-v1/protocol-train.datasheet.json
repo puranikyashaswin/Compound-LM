@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "shard_id": "protocol-train",
+  "source": "synthetic-protocol",
+  "tokenizer_id": "fallback-v1",
+  "document_count_input": 6,
+  "document_count_kept": 6,
+  "token_count": 69,
+  "rejected": {
+    "empty": 0,
+    "exact_duplicate": 0,
+    "near_duplicate": 0
+  },
+  "preprocessing_wall_clock_s": 0.0008192499990400393,
+  "preprocessing_cost_usd": 0.0,
+  "shard_sha256": "a50194c2d5dc8d2aee6102230ff75952b0bd43d26515e200f551a7c9eabb0eac",
+  "datasheet_hash": "d916d8d4ba61429aac4d53b1846283a88ad4b448d1781e397361183922176dac"
+}

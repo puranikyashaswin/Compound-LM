@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compound-lm"
+version = "0.1.0"
+description = "Auditable experiments for compute-efficient language-model training"
+requires-python = ">=3.10"
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+training = ["torch>=2.2", "transformers>=4.40", "lm-eval>=0.4.2"]
+data = ["datatrove>=0.4.0", "datasets>=2.18"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

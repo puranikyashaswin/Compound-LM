@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "shard_id": "toy-v1",
+  "source": "synthetic-toy",
+  "tokenizer_id": "fallback-v1",
+  "document_count_input": 32,
+  "document_count_kept": 8,
+  "token_count": 90,
+  "rejected": {
+    "empty": 0,
+    "exact_duplicate": 24,
+    "near_duplicate": 0
+  },
+  "preprocessing_wall_clock_s": 0.0008117910001601558,
+  "preprocessing_cost_usd": 0.0,
+  "shard_sha256": "cb36b4c3d624b7fb7070d2ea8f0971451131092541be71f11b89e498ed38aa12",
+  "datasheet_hash": "f95955d0339e50a960dbb83bc11c3bb4dd78b612c6bc6e5f52b985f34a364435"
+}

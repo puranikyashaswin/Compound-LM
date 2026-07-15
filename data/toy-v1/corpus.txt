@@ -1,0 +1,32 @@
+the reference model learns to predict the next token in a packed sequence
+compound efficiency levers are measured against a fair reproducible baseline
+an append only ledger records every audited run with a checkpoint hash
+health checks terminate a run instead of rationalizing a broken result
+document boundaries prevent cross document attention inside a packed batch
+provenance manifests make a model change auditable and not merely repeatable
+the frozen evaluation contract is fixed before the first baseline run begins
+muon optimizes eligible two dimensional weights while adamw handles the rest
+the reference model learns to predict the next token in a packed sequence
+compound efficiency levers are measured against a fair reproducible baseline
+an append only ledger records every audited run with a checkpoint hash
+health checks terminate a run instead of rationalizing a broken result
+document boundaries prevent cross document attention inside a packed batch
+provenance manifests make a model change auditable and not merely repeatable
+the frozen evaluation contract is fixed before the first baseline run begins
+muon optimizes eligible two dimensional weights while adamw handles the rest
+the reference model learns to predict the next token in a packed sequence
+compound efficiency levers are measured against a fair reproducible baseline
+an append only ledger records every audited run with a checkpoint hash
+health checks terminate a run instead of rationalizing a broken result
+document boundaries prevent cross document attention inside a packed batch
+provenance manifests make a model change auditable and not merely repeatable
+the frozen evaluation contract is fixed before the first baseline run begins
+muon optimizes eligible two dimensional weights while adamw handles the rest
+the reference model learns to predict the next token in a packed sequence
+compound efficiency levers are measured against a fair reproducible baseline
+an append only ledger records every audited run with a checkpoint hash
+health checks terminate a run instead of rationalizing a broken result
+document boundaries prevent cross document attention inside a packed batch
+provenance manifests make a model change auditable and not merely repeatable
+the frozen evaluation contract is fixed before the first baseline run begins
+muon optimizes eligible two dimensional weights while adamw handles the rest

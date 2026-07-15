@@ -1,0 +1,18 @@
+schema_version: 1
+contract_id: E-v1
+description: "Frozen capability evaluation contract for 200M causal language models"
+tasks:
+  - hellaswag
+  - arc_easy
+  - arc_challenge
+  - piqa
+  - winogrande
+  - lambada_openai
+  - mmlu
+settings:
+  num_fewshot: 0
+  batch_size: 1
+  seed: 1234
+  aggregate: unweighted_mean
+  primary_metric: aggregate_accuracy
+  secondary_metric: fineweb_validation_loss

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "shard_id": "protocol-heldout",
+  "source": "synthetic-protocol",
+  "tokenizer_id": "fallback-v1",
+  "document_count_input": 4,
+  "document_count_kept": 4,
+  "token_count": 46,
+  "rejected": {
+    "empty": 0,
+    "exact_duplicate": 0,
+    "near_duplicate": 0
+  },
+  "preprocessing_wall_clock_s": 0.0003803750005317852,
+  "preprocessing_cost_usd": 0.0,
+  "shard_sha256": "9de5f6698bcfcb2633669fa2cd4b40b3907fa175fd8ac2344931dbec8abb5276",
+  "datasheet_hash": "88baba65ee4016294b92e4a8c8f9706c3437a23bdb23f09b81063ab3d58628cd"
+}

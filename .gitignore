@@ -1,0 +1,9 @@
+runs/
+data/real-v1/
+data/protocol-v1/*.jsonl
+outputs/
+work/
+__pycache__/
+*.pyc
+src/compound_lm.egg-info/
+.venv/
