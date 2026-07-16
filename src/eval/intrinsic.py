@@ -10,22 +10,12 @@ runner is replaced by the frozen E-v1 harness once GPUs are available.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
-from pathlib import Path
 from typing import Any
 
+from src.data.loader import open_shard
 from src.model.reference import require_torch
-
-
-def _doc_id_tensor(document_ids: list[str]):
-    import torch
-    return torch.tensor(
-        [int(hashlib.sha256(x.encode()).hexdigest()[:8], 16) if x != "__pad__" else -1
-         for x in document_ids],
-        dtype=torch.long,
-    )
 
 
 def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu") -> dict[str, Any]:
@@ -42,17 +32,20 @@ def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu") -> dic
     model.to(device).eval()
     vocab = config["vocab_size"]
 
-    rows = [json.loads(line) for line in Path(heldout_shard).read_text().splitlines() if line.strip()]
-    if not rows:
+    # Same loader the trainer uses, so a held-out score is measured against the
+    # data it claims regardless of which shard format is on disk.
+    rows = open_shard(heldout_shard)
+    if len(rows) == 0:
         raise ValueError("held-out shard is empty")
 
     total_nll = 0.0
     total_correct = 0
     total_tokens = 0
     with torch.no_grad():
-        for row in rows:
-            ids = torch.tensor([row["input_ids"]], dtype=torch.long, device=device) % vocab
-            docs = _doc_id_tensor(row["document_ids"])[None, :].to(device)
+        for index in range(len(rows)):
+            batch_ids, batch_docs = rows.batch(index, 1)
+            ids = torch.tensor(batch_ids, dtype=torch.long, device=device) % vocab
+            docs = torch.tensor(batch_docs, dtype=torch.long, device=device)
             logits = model(ids, docs)
             # Predict position t+1 from t; only score targets inside a real document.
             pred_logits = logits[:, :-1].reshape(-1, vocab)

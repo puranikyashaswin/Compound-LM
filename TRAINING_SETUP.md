@@ -1,5 +1,34 @@
 # Real-training setup
 
+## Sizing the corpus to the model (read this first)
+
+A run can pass every health gate and still measure nothing. The first GPU
+validation trained a 22.4M-parameter model for 450M token-positions over a
+corpus of **1.67M unique tokens** — 270 epochs over the same data, ~268× less
+data than the model wanted. It cost 3.6 GPU-hours and could only measure
+memorization: held-out accuracy plateaued at ~0.11 and Muon tied the baseline,
+because in that regime the optimizer barely matters.
+
+`src/data/budget.py` now refuses such a plan before any GPU time is spent, and
+`scripts/kaggle_validation.py` calls it up front. Size the corpus first:
+
+```bash
+# ~20 tokens/param for a 22.4M model => ~450M unique tokens, streamed from
+# FineWeb-Edu into memory-mapped binary shards (never held in RAM).
+python scripts/build_corpus.py --for-params 22400000 \
+    --sequence-length 512 --out-dir data/real-v2
+
+# Then the four-run matrix; the budget gate must report green/amber first.
+python scripts/kaggle_validation.py --corpus data/real-v2 --lr-schedule
+```
+
+Binary shards (`src/data/binshard.py`) exist because the JSONL loader holds
+every token as a Python int: a 450M-token corpus would need ~30GB of RAM and
+OOM a Kaggle instance. The binary format memory-maps, so shard size no longer
+bounds memory. Both formats produce identical loss curves
+(`tests/test_binshard_training.py`), so the swap does not change the science.
+
+
 The framework runs real experiments once the training environment is installed. `scripts/preflight.py` reports what is missing without fabricating results; `scripts/bootstrap.py` goes further and *prompts* for each missing piece, offering to install or provision it, then can drive one real end-to-end toy run.
 
 ## Interactive bootstrap (recommended)

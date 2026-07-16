@@ -43,8 +43,12 @@ HELDOUT_DOCUMENTS = [_window(offset) for offset in range(1, len(CYCLE_WORDS), 4)
 # Toy model dimensions — small enough for CPU, large enough to learn the corpus.
 MODEL = dict(vocab_size=4096, d_model=96, n_layers=3, n_heads=4)
 SEQ_LEN = 96
-STEPS = 400
-CHECKPOINT_EVERY = 25
+STEPS = 200
+# The cycle rule is learned within the first ~25 steps, so a coarse grid puts
+# every run's target crossing before its first checkpoint: the costs are then
+# all unreported lower bounds that tie at 1.000x. Sample early enough to see
+# the crossing itself.
+CHECKPOINT_EVERY = 5
 # batch_size=1 makes per-step gradient norms swing with whichever packed
 # sequence was drawn, which trips the spike gate on converged runs. Batching
 # is applied identically to baseline and lever runs, so comparisons stay fair.
@@ -143,7 +147,8 @@ def main():
     parser.add_argument("--out", default=str(ROOT / "outputs" / "protocol-report.json"))
     args = parser.parse_args()
 
-    from src.ledger.compounding import compounding_report, cost_to_score
+    from src.ledger.compounding import (assert_costs_resolved, compounding_report,
+                                        cost_to_score_detail)
 
     print("== 1. Build disjoint train / held-out shards ==")
     shards = build_shards()
@@ -178,10 +183,14 @@ def main():
             "learn a signal before reporting compounding."
         )
     target = round(max_reached * 0.9, 4)  # a score both runs demonstrably reach
+    details = {r["name"]: cost_to_score_detail(r["curve"], target) for r in runs}
+    # A cost that was never actually observed cannot ground a multiplier.
+    assert_costs_resolved(details)
     comp_rows = []
     for r in runs:
-        cost = cost_to_score(r["curve"], target)
-        comp_rows.append({"name": r["name"], "levers": r["levers"], "seed": r["seed"], "recipe_cost": cost,
+        cost = details[r["name"]]["cost"]
+        comp_rows.append({"name": r["name"], "levers": r["levers"], "seed": r["seed"],
+                          "recipe_cost": cost, "cost_status": details[r["name"]]["status"],
                           "reached": cost is not None})
     reachable = [r for r in comp_rows if r["reached"]]
     report = {"target_score": target}

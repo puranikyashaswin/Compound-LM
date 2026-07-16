@@ -19,6 +19,23 @@ def test_lever_that_never_reaches_target_reports_instead_of_crashing():
     assert "muon" not in report["isolated_multipliers"]
 
 
+def test_all_lower_bound_costs_are_refused_as_unresolved():
+    """Every run crossing the target before its first checkpoint measures nothing."""
+    from src.ledger.compounding import assert_costs_resolved
+    details = {name: {"cost": 10.0, "status": "lower_bound"}
+               for name in ("baseline-s17", "baseline-s23", "muon-s17", "muon-s23")}
+    with pytest.raises(ValueError, match="unresolved_capability_cost"):
+        assert_costs_resolved(details)
+
+
+def test_a_resolved_comparison_is_allowed_through():
+    from src.ledger.compounding import assert_costs_resolved
+    assert_costs_resolved({
+        "baseline-s17": {"cost": 10.0, "status": "interpolated"},
+        "muon-s17": {"cost": 6.0, "status": "lower_bound"},
+    })
+
+
 def test_compounding_refuses_a_zero_target_that_every_run_trivially_clears():
     """The all-zero-eval trap: a 0 target makes every run tie at 1.000x."""
     rows = [

@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import math
 import random
 import time
 from pathlib import Path
 
+from src.data.loader import open_shard
 from src.health.check import check_checkpoint, RollingMedian
 from src.ledger.writer import append_entry
 from src.model.reference import require_torch
@@ -31,14 +32,38 @@ def masked_next_token_loss(logits, ids, document_ids):
     return torch.nn.functional.cross_entropy(pred_logits, masked_targets, ignore_index=ignore_index)
 
 
+def lr_at_step(step: int, *, total_steps: int, base_lr: float,
+               warmup_fraction: float = 0.01, min_lr_fraction: float = 0.1) -> float:
+    """Linear warmup then cosine decay -- the standard LM schedule.
+
+    A constant LR leaves a real-scale baseline weaker than it should be, which
+    inflates every lever measured against it. Applied identically to every arm.
+    """
+    if total_steps < 1:
+        raise ValueError("total_steps must be positive")
+    if not 0.0 <= warmup_fraction < 1.0:
+        raise ValueError("warmup_fraction must be in [0, 1)")
+    if not 0.0 <= min_lr_fraction <= 1.0:
+        raise ValueError("min_lr_fraction must be in [0, 1]")
+    warmup_steps = int(total_steps * warmup_fraction)
+    if step < warmup_steps:
+        return base_lr * (step + 1) / max(1, warmup_steps)
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    progress = min(1.0, max(0.0, progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return base_lr * (min_lr_fraction + (1.0 - min_lr_fraction) * cosine)
+
+
 def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
           d_model: int = 128, n_layers: int = 2, n_heads: int = 4,
           steps: int = 10, learning_rate: float = 3e-4, seed: int = 17,
           device: str = "cpu", resume: str | None = None,
           checkpoint_every: int = 10, ledger_path: str | None = None,
           run_id: str | None = None, use_muon: bool = False,
+          muon_lr: float = 0.02,
           heldout_shard: str | None = None, levers_on: list[str] | None = None,
-          batch_size: int = 1) -> dict:
+          batch_size: int = 1, lr_schedule: bool = False,
+          warmup_fraction: float = 0.01, min_lr_fraction: float = 0.1) -> dict:
     require_torch()
     import torch
     from src.model.reference import ReferenceLM
@@ -49,18 +74,9 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         assert_disjoint_shards(shard, heldout_shard)
 
     random.seed(seed); torch.manual_seed(seed)
-    rows = [json.loads(line) for line in Path(shard).read_text().splitlines() if line.strip()]
-    if not rows:
-        raise ValueError("packed shard is empty")
-    
-    # Pre-cache document ID hashes to avoid hashlib overhead in training loop
-    for row in rows:
-        row["doc_ids_int"] = [
-            x if isinstance(x, int) else (int(hashlib.sha256(x.encode()).hexdigest()[:8], 16) if x != "__pad__" else -1)
-            for x in row["document_ids"]
-        ]
-        
-    model = ReferenceLM(vocab_size, d_model, n_layers, n_heads, len(rows[0]["input_ids"]))
+    rows = open_shard(shard)
+
+    model = ReferenceLM(vocab_size, d_model, n_layers, n_heads, rows.sequence_length)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     muon_optimizer = None
@@ -69,7 +85,7 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         from src.optim.muon import Muon, partition_named_parameters
         partition = partition_named_parameters(model.named_parameters())
         by_name = dict(model.named_parameters())
-        muon_optimizer = Muon([by_name[name] for name in partition.muon], lr=0.02)
+        muon_optimizer = Muon([by_name[name] for name in partition.muon], lr=muon_lr)
         optimizer = torch.optim.AdamW([by_name[name] for name in partition.adamw], lr=learning_rate)
         optimizer_groups = {"adamw": list(partition.adamw), "muon": list(partition.muon)}
     
@@ -133,12 +149,24 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     n_params = sum(p.numel() for p in model.parameters())
 
     for step in range(start_step, steps):
-        batch_rows = [rows[(data_position + i) % len(rows)] for i in range(batch_size)]
+        batch_ids, batch_docs = rows.batch(data_position, batch_size)
         data_position = (data_position + batch_size) % len(rows)
 
-        ids = torch.tensor([row["input_ids"] for row in batch_rows], dtype=torch.long, device=device) % vocab_size
-        docs = torch.tensor([row["doc_ids_int"] for row in batch_rows], dtype=torch.long, device=device)
-        
+        ids = torch.tensor(batch_ids, dtype=torch.long, device=device) % vocab_size
+        docs = torch.tensor(batch_docs, dtype=torch.long, device=device)
+
+        if lr_schedule:
+            # Both optimizers follow the same shape, each scaled from its own
+            # base LR, so a schedule cannot advantage one arm over the other.
+            scale = lr_at_step(step, total_steps=steps, base_lr=1.0,
+                               warmup_fraction=warmup_fraction,
+                               min_lr_fraction=min_lr_fraction)
+            for group in optimizer.param_groups:
+                group["lr"] = learning_rate * scale
+            if muon_optimizer is not None:
+                for group in muon_optimizer.param_groups:
+                    group["lr"] = muon_lr * scale
+
         logits = model(ids, docs)
         
         # Use masked target cross entropy loss
@@ -176,7 +204,7 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
                 eval_scores = evaluate(str(checkpoint), heldout_shard, device=device)
                 eval_scores["smoke"] = eval_scores["val_acc"]  # higher-is-better headline score
             
-            tokens = (step + 1) * batch_size * len(rows[0]["input_ids"])
+            tokens = (step + 1) * batch_size * rows.sequence_length
             train_flops = 6.0 * n_params * tokens
             
             if ledger_path:
@@ -215,7 +243,7 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         eval_scores = evaluate(str(checkpoint), heldout_shard, device=device)
         eval_scores["smoke"] = eval_scores["val_acc"]
         
-    tokens = final_step * batch_size * len(rows[0]["input_ids"])
+    tokens = final_step * batch_size * rows.sequence_length
     train_flops = 6.0 * n_params * tokens
     
     result = {"checkpoint": str(checkpoint), "steps": final_step, "losses": losses,

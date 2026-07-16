@@ -29,6 +29,28 @@ def cost_to_score(checkpoints: list[dict[str, float]], target: float) -> float |
     return cost_to_score_detail(checkpoints, target)["cost"]
 
 
+def assert_costs_resolved(details: dict[str, dict[str, Any]]) -> None:
+    """Refuse a comparison built entirely from lower bounds.
+
+    ``cost_to_score_detail`` reports ``lower_bound`` when a run already exceeded
+    the target at its first checkpoint: the true cost is somewhere below that
+    checkpoint and was never observed. If every run is a lower bound, they all
+    carry the same first cost and tie at 1.000x -- which reads as "no lever
+    helped" when the truth is "the checkpoint grid was too coarse to see".
+    """
+    if not details:
+        raise ValueError("no runs to check")
+    statuses = {name: detail.get("status") for name, detail in details.items()}
+    unresolved = [name for name, status in statuses.items() if status == "lower_bound"]
+    if len(unresolved) == len(statuses):
+        raise ValueError(
+            "unresolved_capability_cost: every run already exceeded the target at its "
+            "first checkpoint, so every cost is a lower bound and all multipliers would "
+            f"tie at 1.000x by construction (runs: {sorted(unresolved)}). Checkpoint more "
+            "often early, or raise the target."
+        )
+
+
 def compounding_report(rows: list[dict[str, Any]], *, target_score: float) -> dict[str, Any]:
     """Compare isolated multipliers with compound multipliers.
 

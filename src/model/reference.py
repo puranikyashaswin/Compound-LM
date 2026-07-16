@@ -5,6 +5,8 @@ without it, while real training fails explicitly with installation guidance.
 """
 from __future__ import annotations
 
+import math
+
 try:
     import torch
     from torch import nn
@@ -62,6 +64,30 @@ if torch is not None:
             self.norm = nn.LayerNorm(d_model)
             self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
             self.lm_head.weight = self.token_embedding.weight
+            self.apply(self._init_weights)
+            # GPT-2's scaled init: with n_layers residual additions feeding the
+            # stream, unscaled output projections make activations grow with
+            # depth. Applied after _init_weights so it wins for these tensors.
+            for name, parameter in self.named_parameters():
+                if name.endswith("attn.out.weight") or name.endswith("mlp.2.weight"):
+                    nn.init.normal_(parameter, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
+
+        @staticmethod
+        def _init_weights(module) -> None:
+            """Small-std init.
+
+            nn.Embedding defaults to N(0, 1); since lm_head is tied to the token
+            embedding, that puts initial logits at std ~= sqrt(d_model), which is
+            saturated well beyond a uniform distribution -- an untrained model
+            scores *worse* than random and training spends its early budget
+            merely undoing the initialization.
+            """
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
         def forward(self, input_ids: torch.Tensor, document_ids: torch.Tensor | None = None) -> torch.Tensor:
             _, t = input_ids.shape

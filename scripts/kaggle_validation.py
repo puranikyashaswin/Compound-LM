@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -15,9 +14,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.train.reference import train
-from src.ledger.compounding import compounding_report, cost_to_score
+from src.ledger.compounding import (assert_costs_resolved, compounding_report,
+                                    cost_to_score_detail)
 from src.ledger.writer import read_entries
-from src.data.packing import pack_shard
+from src.data.binshard import PackedShard
+from src.data.budget import check_token_budget
+
+
+def count_params(model_config: dict, sequence_length: int) -> int:
+    from src.model.reference import ReferenceLM
+    model = ReferenceLM(**model_config, max_seq_len=sequence_length)
+    return sum(p.numel() for p in model.parameters())
 
 def main():
     parser = argparse.ArgumentParser()
@@ -25,7 +32,25 @@ def main():
     parser.add_argument("--steps", type=int, default=13750, help="Number of training steps")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (sequences per step)")
     parser.add_argument("--seq-len", type=int, default=512, help="Sequence length")
+    parser.add_argument("--corpus", default=str(ROOT / "data" / "real-v2"),
+                        help="Directory holding binary 'train' and 'heldout' shards "
+                             "(build with scripts/build_corpus.py)")
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--n-layers", type=int, default=12)
+    parser.add_argument("--n-heads", type=int, default=8)
+    parser.add_argument("--muon-lr", type=float, default=0.02)
+    parser.add_argument("--lr-schedule", action="store_true",
+                        help="Warmup + cosine decay, applied identically to every arm")
+    parser.add_argument("--max-epochs", type=float, default=4.0,
+                        help="Refuse a run that would loop the corpus more than this")
+    parser.add_argument("--analyze-only", metavar="LEDGER",
+                        help="Skip training; run the analysis against an existing "
+                             "ledger jsonl (e.g. one downloaded from a Kaggle run)")
     args = parser.parse_args()
+
+    if args.analyze_only:
+        analyze(Path(args.analyze_only), args)
+        return
 
     # Determine device
     if args.device == "auto":
@@ -41,22 +66,47 @@ def main():
 
     print(f"Using device: {device}")
     
-    # 1. Repack shards to the target sequence length (512+)
-    print(f"\n--- Repacking shards to sequence length {args.seq_len} ---")
-    data_dir = ROOT / "data" / "real-v1"
-    train_packed = data_dir / f"train-packed-{args.seq_len}.jsonl"
-    heldout_packed = data_dir / f"heldout-packed-{args.seq_len}.jsonl"
+    # 1. Open the binary corpus (memory-mapped; shard size does not bound RAM)
+    corpus = Path(args.corpus)
+    train_packed = corpus / "train"
+    heldout_packed = corpus / "heldout"
+    if not train_packed.with_suffix(".meta.json").exists():
+        raise SystemExit(
+            f"no binary corpus at {corpus}. Build one first, sized for the model:\n"
+            f"  python scripts/build_corpus.py --for-params 22400000 "
+            f"--sequence-length {args.seq_len} --out-dir {corpus}"
+        )
+    train_shard = PackedShard(train_packed)
+    print(f"\nCorpus: {train_shard.meta['real_tokens']:,} unique train tokens, "
+          f"{len(train_shard):,} sequences of {train_shard.sequence_length}")
 
-    pack_shard(data_dir / "train.jsonl", train_packed, sequence_length=args.seq_len)
-    pack_shard(data_dir / "heldout.jsonl", heldout_packed, sequence_length=args.seq_len)
-    
-    # Model configuration (~22.4M parameters)
+    # Defaults give ~22.4M parameters; override to smoke-test small or to scale up.
     MODEL_CONFIG = dict(
         vocab_size=50257,
-        d_model=256,
-        n_layers=12,
-        n_heads=8
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
     )
+
+    # 2. Token-budget gate BEFORE any GPU time is spent. The previous run of
+    #    this script looped a 1.67M-token corpus 270 times for 3.6 GPU-hours
+    #    and could only measure memorization; no other gate here catches that.
+    n_params = count_params(MODEL_CONFIG, train_shard.sequence_length)
+    budget = check_token_budget(unique_tokens=train_shard.meta["real_tokens"],
+                                steps=args.steps, batch_size=args.batch_size,
+                                sequence_length=train_shard.sequence_length,
+                                n_params=n_params, max_epochs=args.max_epochs)
+    print(f"\n--- Token budget ({n_params:,} params) ---")
+    print(f"  epochs over corpus: {budget.epochs:.2f}x")
+    print(f"  tokens/param:       {budget.tokens_per_param:.1f} "
+          f"({budget.chinchilla_ratio:.2f}x Chinchilla)")
+    print(f"  status:             {budget.status.upper()}")
+    for warning in budget.warnings:
+        print(f"  [warn] {warning}")
+    if budget.status == "red":
+        for failure in budget.failures:
+            print(f"  [FAIL] {failure}")
+        raise SystemExit("token_budget_gate: refusing to spend GPU hours on a void run")
 
     ledger_path = ROOT / "work" / "kaggle-ledger.jsonl"
     if ledger_path.exists():
@@ -83,6 +133,8 @@ def main():
             checkpoint_every=checkpoint_every,
             heldout_shard=str(heldout_packed),
             use_muon=use_muon,
+            muon_lr=args.muon_lr,
+            lr_schedule=args.lr_schedule,
             levers_on=["optimizer"] if use_muon else [],
             ledger_path=str(ledger_path),
             run_id=run_id,
@@ -100,11 +152,17 @@ def main():
     run_one("optimizer", 23, use_muon=True)
 
     # 4. Analysis and Compounding Report
+    analyze(ledger_path, args)
+
+
+def analyze(ledger_path: Path, args) -> None:
     print("\n\n==========================================")
     print("ANALYSIS AND EVALUATION")
     print("==========================================")
-    
+
     entries = read_entries(ledger_path)
+    if not entries:
+        raise SystemExit(f"ledger is empty or missing: {ledger_path}")
     run_curves = {}
     for entry in entries:
         run_id = entry["run_id"]
@@ -133,14 +191,26 @@ def main():
     print(f"  Muon s17:     {m17_final:.4f}")
     print(f"  Muon s23:     {m23_final:.4f}")
 
-    # Explicitly find target score well clear of early noise
-    target_score = 0.15  # Hardcoded capability target (15.0% accuracy), well clear of noise floor
-    print(f"\nUsing hardcoded capability target score: {target_score:.4f}")
+    # Target derived from what every run demonstrably reached (never a guess
+    # made before the data existed): 0.9 x the weakest run's best score, the
+    # same rule scripts/run_protocol.py uses. A hardcoded target above the
+    # reachable range would abort the analysis after hours of paid training.
+    max_reached = min(max(pt["score"] for pt in curve) for curve in run_curves.values())
+    if max_reached <= 0:
+        raise SystemExit("no_capability_signal: every run scored 0 on held-out; nothing to compare")
+    target_score = round(max_reached * 0.9, 4)
+    print(f"\nDerived capability target score (0.9 x weakest run's best): {target_score:.4f}")
 
     # Generate compounding report at that target score
+    details = {run_id: cost_to_score_detail(curve, target_score)
+               for run_id, curve in run_curves.items()}
+    # If every run cleared the target before its first checkpoint, no cost was
+    # observed and the multipliers would all tie at 1.000x by construction.
+    assert_costs_resolved(details)
+
     comp_rows = []
-    for run_id, curve in run_curves.items():
-        cost = cost_to_score(curve, target_score)
+    for run_id in run_curves:
+        cost = details[run_id]["cost"]
         levers = ["optimizer"] if "optimizer" in run_id else []
         seed = 17 if "s17" in run_id else 23
         comp_rows.append({
@@ -148,6 +218,7 @@ def main():
             "levers": levers,
             "seed": seed,
             "recipe_cost": cost,
+            "cost_status": details[run_id]["status"],
             "reached": cost is not None
         })
 
