@@ -1,4 +1,43 @@
+import pytest
+
 from src.ledger.compounding import compounding_report, cost_to_score, cost_to_score_detail
+
+
+def test_lever_that_never_reaches_target_reports_instead_of_crashing():
+    """A None cost is a real outcome ("never got there"), not an error."""
+    rows = [
+        {"name": "baseline-17", "seed": 17, "levers": [], "recipe_cost": 100},
+        {"name": "baseline-23", "seed": 23, "levers": [], "recipe_cost": 100},
+        {"name": "muon-17", "seed": 17, "levers": ["muon"], "recipe_cost": None},
+        {"name": "muon-23", "seed": 23, "levers": ["muon"], "recipe_cost": None},
+    ]
+    report = compounding_report(rows, target_score=0.9)
+    muon = [row for row in report["rows"] if row["levers"] == ["muon"]]
+    assert all(row["observed_multiplier"] is None for row in muon)
+    assert all(row["status"] == "not_reached" for row in muon)
+    # A run that never reached the target must not earn a multiplier.
+    assert "muon" not in report["isolated_multipliers"]
+
+
+def test_compounding_refuses_a_zero_target_that_every_run_trivially_clears():
+    """The all-zero-eval trap: a 0 target makes every run tie at 1.000x."""
+    rows = [
+        {"name": "baseline-17", "seed": 17, "levers": [], "recipe_cost": 100},
+        {"name": "baseline-23", "seed": 23, "levers": [], "recipe_cost": 100},
+        {"name": "muon-17", "seed": 17, "levers": ["muon"], "recipe_cost": 100},
+        {"name": "muon-23", "seed": 23, "levers": ["muon"], "recipe_cost": 100},
+    ]
+    with pytest.raises(ValueError, match="target_score must be positive"):
+        compounding_report(rows, target_score=0.0)
+
+
+def test_compounding_refuses_a_baseline_that_never_reached_target():
+    rows = [
+        {"name": "baseline-17", "seed": 17, "levers": [], "recipe_cost": None},
+        {"name": "baseline-23", "seed": 23, "levers": [], "recipe_cost": None},
+    ]
+    with pytest.raises(ValueError, match="baseline never reached"):
+        compounding_report(rows, target_score=0.9)
 
 
 def test_cost_to_score_interpolates_without_extrapolation():

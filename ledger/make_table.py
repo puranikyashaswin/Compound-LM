@@ -18,6 +18,10 @@ def make_table(ledger_path: str, readme_path: str, target_score: float = 0.1) ->
     rows = read_entries(ledger_path)
     if not rows:
         table = "_No completed runs yet._"
+    elif all(r.get("eval_scores", {}).get("smoke", 0.0) <= 0 for r in rows):
+        # Publishing all-zero scores invites reading them as a null result. No
+        # run demonstrated any capability, so there is nothing to compare.
+        table = "_No run with a measured capability signal yet._"
     else:
         baseline = next((r for r in rows if not r.get("levers_on")), None)
         base_cost = _cost_to_score(baseline, target_score) if baseline else None

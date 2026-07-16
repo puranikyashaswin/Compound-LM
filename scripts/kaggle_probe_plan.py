@@ -24,12 +24,20 @@ def main():
         raise SystemExit("kaggle_probe_requires_cuda: run this script on the T4 notebook")
     data = ROOT / "data/real-v1/train-packed.jsonl"
     rows = [json.loads(x) for x in data.read_text().splitlines() if x.strip()]
+    required = {"input_ids", "document_ids"}
+    if not rows or not required.issubset(rows[0]):
+        raise SystemExit(f"packed_schema_mismatch: expected fields {sorted(required)}")
+    if len(rows[0]["input_ids"]) != SEQ_LEN or len(rows[0]["document_ids"]) != SEQ_LEN:
+        raise SystemExit(f"packed_sequence_length_mismatch: expected {SEQ_LEN}")
     model = ReferenceLM(**MODEL, max_seq_len=SEQ_LEN).cuda().train()
     params = sum(p.numel() for p in model.parameters())
     probes = []
     for batch in (8, 16):
         ids = torch.tensor([rows[i]["input_ids"] for i in range(batch)], device="cuda", dtype=torch.long) % MODEL["vocab_size"]
-        docs = torch.zeros_like(ids)
+        # Match train(): document IDs are supplied by pack_shard and preserve
+        # block-diagonal attention semantics during the throughput probe.
+        docs = torch.tensor([[0 if d != "__pad__" else -1 for d in rows[i]["document_ids"]]
+                             for i in range(batch)], device="cuda", dtype=torch.long)
         opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
         for _ in range(3):
             loss = torch.nn.functional.cross_entropy(model(ids, docs)[:, :-1].reshape(-1, MODEL["vocab_size"]), ids[:, 1:].reshape(-1))

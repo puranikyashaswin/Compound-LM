@@ -1,0 +1,25 @@
+schema_version: 1
+run_name: baseline-200m
+scale: 200m
+seed: 17
+model:
+  family: llama_dense
+  parameters: 200000000
+  tokenizer: reex-1
+  sequence_length: 2048
+data:
+  shard: raw-v1
+  tokens: 5000000000
+  prep_cost_usd: 0.0
+training:
+  optimizer: adamw
+  schedule: cosine
+  precision: bf16
+  systems: baseline
+  learning_rate: 0.0003
+  batch_tokens: 4194304
+evaluation_contract: E-v1
+cost:
+  gpu_type: unknown
+  usd_per_gpu_hour: 0.0
+levers: []

@@ -20,7 +20,10 @@ def test_padding_is_excluded_from_training_loss():
     import torch
     from src.train.reference import masked_next_token_loss
 
-    logits = torch.tensor([[[0.0, 12.0, 0.0], [0.0, 0.0, 12.0], [12.0, 0.0, 0.0]]])
+    # logits[:, :-1] predicts ids[:, 1:]: position 0 must predict token 2.
+    # Position 1's target is padding (document_id -1) and is ignored, so its
+    # deliberately wrong logits must not reach the loss.
+    logits = torch.tensor([[[0.0, 0.0, 12.0], [0.0, 12.0, 0.0], [12.0, 0.0, 0.0]]])
     ids = torch.tensor([[1, 2, 0]])
     document_ids = torch.tensor([[4, 4, -1]])
     loss = masked_next_token_loss(logits, ids, document_ids)

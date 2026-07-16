@@ -17,11 +17,9 @@ def cost_to_score_detail(checkpoints: list[dict[str, float]], target: float) -> 
     if target <= points[0][1]:
         return {"cost": points[0][0], "status": "lower_bound", "first_cost": points[0][0]}
     for (cost_a, score_a), (cost_b, score_b) in zip(points, points[1:]):
-        if score_a == target:
-            return cost_a
         if min(score_a, score_b) <= target <= max(score_a, score_b):
             if score_b == score_a:
-                return min(cost_a, cost_b)
+                return {"cost": min(cost_a, cost_b), "status": "reached"}
             return {"cost": cost_a + (target - score_a) * (cost_b - cost_a) / (score_b - score_a), "status": "interpolated"}
     return {"cost": points[-1][0], "status": "reached"} if points[-1][1] == target else {"cost": None, "status": "not_reached"}
 
@@ -52,19 +50,40 @@ def compounding_report(rows: list[dict[str, Any]], *, target_score: float) -> di
                     f"lever configuration '{levers_str}' must have at least two distinct seeds, but has {len(seeds)}"
                 )
 
+    # A non-positive target is not a low bar, it is an absent one: every run
+    # clears a target of zero at its first checkpoint and ties at 1.000x, which
+    # reads as "no lever compounded" when the truth is "nothing was measured".
+    if target_score <= 0:
+        raise ValueError(
+            f"target_score must be positive to compare capability at cost, got {target_score}; "
+            "a zero target means no run demonstrated any capability"
+        )
     baseline = next((row for row in rows if not row.get("levers")), None)
     if baseline is None:
         raise ValueError("compounding report requires a baseline row")
+    if baseline.get("recipe_cost") is None:
+        raise ValueError(
+            "baseline never reached the target score, so no multiplier is defined against it"
+        )
     baseline_cost = float(baseline["recipe_cost"])
+
+    # A None recipe_cost means the run never reached the target score. That is a
+    # real outcome, not an error: such a run yields no multiplier and is excluded
+    # from every isolated multiplier rather than being scored as if it had won.
     isolated = {}
     for row in rows:
         levers = row.get("levers", [])
-        if len(levers) == 1:
+        if len(levers) == 1 and row.get("recipe_cost") is not None:
             isolated[levers[0]] = baseline_cost / float(row["recipe_cost"])
     output_rows = []
     for row in rows:
-        cost = float(row["recipe_cost"])
-        observed = baseline_cost / cost
+        if row.get("recipe_cost") is None:
+            output_rows.append({**row, "observed_multiplier": None,
+                                "independent_product": None,
+                                "overlap_coefficient": None,
+                                "status": "not_reached"})
+            continue
+        observed = baseline_cost / float(row["recipe_cost"])
         product = 1.0
         for lever in row.get("levers", []):
             product *= isolated.get(lever, 1.0)
