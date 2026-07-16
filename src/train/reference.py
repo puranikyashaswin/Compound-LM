@@ -10,7 +10,7 @@ from pathlib import Path
 
 from src.data.loader import open_shard
 from src.health.check import check_checkpoint, RollingMedian
-from src.ledger.writer import append_entry
+from src.ledger.writer import append_entry, read_entries
 from src.model.reference import require_torch
 from src.provenance.core import config_hash, sha256_bytes
 
@@ -30,6 +30,61 @@ def masked_next_token_loss(logits, ids, document_ids):
     masked_targets[target_docs < 0] = ignore_index
 
     return torch.nn.functional.cross_entropy(pred_logits, masked_targets, ignore_index=ignore_index)
+
+
+def _append_or_verify_replay(ledger_path: str, entry: dict) -> None:
+    """Append a ledger row, tolerating an identical deterministic replay.
+
+    Resuming restarts from the newest readable checkpoint, which may sit behind
+    the newest ledger row if a ledgered checkpoint was later lost or truncated.
+    The replayed steps then produce rows that already exist, and the append-only
+    guard would reject them -- killing the recovery it exists to protect.
+
+    A replay reproduces the measurements, so the recorded science must match.
+    It is compared on loss and eval scores rather than ``checkpoint_hash``:
+    resuming yields bitwise-equal weights but *not* a byte-identical file,
+    because torch.save's container is not stable across a load/re-save cycle.
+    The hash proves file integrity, not state identity, so comparing it here
+    would flag every honest replay as a contradiction.
+    """
+    prior = next((row for row in read_entries(ledger_path)
+                  if row["run_id"] == entry["run_id"] and row["tokens"] == entry["tokens"]), None)
+    if prior is None:
+        append_entry(ledger_path, entry)
+        return
+    measured = ("final_loss", "eval_scores")
+    disagreements = {key: (prior.get(key), entry.get(key)) for key in measured
+                     if prior.get(key) != entry.get(key)}
+    if disagreements:
+        raise ValueError(
+            f"ledger contradiction: {entry['run_id']} at {entry['tokens']} tokens was already "
+            f"recorded with different results {disagreements}. A resumed run must reproduce "
+            f"the measurements it replays."
+        )
+
+
+def resumable_checkpoint(output_dir: str | Path) -> Path | None:
+    """Newest checkpoint in ``output_dir`` that actually loads, or None.
+
+    A crash during ``torch.save`` can leave a truncated file, and that file
+    sorts newest -- so naively resuming from the last checkpoint would fail on
+    exactly the runs that most need to recover. Unreadable candidates are
+    deleted: they carry no recoverable state, and leaving them would let the
+    final-checkpoint reuse path mistake one for a finished run.
+    """
+    require_torch()
+    import torch
+
+    directory = Path(output_dir)
+    if not directory.is_dir():
+        return None
+    for candidate in sorted(directory.glob("checkpoint-*.pt"), reverse=True):
+        try:
+            torch.load(candidate, map_location="cpu", weights_only=False)
+            return candidate
+        except Exception:
+            candidate.unlink(missing_ok=True)
+    return None
 
 
 def lr_at_step(step: int, *, total_steps: int, base_lr: float,
@@ -129,6 +184,29 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     started = time.perf_counter()
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
 
+    def _write_checkpoint(payload: dict, target: Path, attempts: int = 3) -> None:
+        """Write a checkpoint, retrying transient filesystem failures.
+
+        torch.save has been observed failing with "Parent directory does not
+        exist" for a directory that demonstrably exists moments later. The cause
+        is unexplained, so this does not pretend to fix it -- it re-asserts the
+        directory and retries, which turns a lost multi-hour run into a pause.
+        A checkpoint that fails every attempt is removed rather than left as a
+        partial file that a later resume would mistake for a good one.
+        """
+        for attempt in range(attempts):
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(payload, target)
+                return
+            except (RuntimeError, OSError) as error:
+                target.unlink(missing_ok=True)
+                if attempt == attempts - 1:
+                    raise RuntimeError(
+                        f"checkpoint write to {target} failed after {attempts} attempts: {error}"
+                    ) from error
+                time.sleep(0.5 * (attempt + 1))
+
     def save_checkpoint(step: int) -> Path:
         target = out / f"checkpoint-{step:08d}.pt"
         payload = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
@@ -143,7 +221,7 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
                    "shard": str(Path(shard).resolve()),
                    "data_position": data_position,
                    "batch_size": batch_size}
-        torch.save(payload, target)
+        _write_checkpoint(payload, target)
         return target
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -208,7 +286,7 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
             train_flops = 6.0 * n_params * tokens
             
             if ledger_path:
-                append_entry(ledger_path, {
+                _append_or_verify_replay(ledger_path, {
                     "run_id": run_id or f"reference-{config_hash(model.config)[:12]}-{seed}",
                     "config_hash": config_hash(model.config), "commit": "uncommitted",
                     "scale": f"{n_params}p",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -13,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.train.reference import train
+from src.train.reference import resumable_checkpoint, train
 from src.ledger.compounding import (assert_costs_resolved, compounding_report,
                                     cost_to_score_detail)
 from src.ledger.writer import read_entries
@@ -35,6 +36,8 @@ def main():
     parser.add_argument("--corpus", default=str(ROOT / "data" / "real-v2"),
                         help="Directory holding binary 'train' and 'heldout' shards "
                              "(build with scripts/build_corpus.py)")
+    parser.add_argument("--vocab-size", type=int, default=50257,
+                        help="Must match the corpus tokenizer (GPT-2 = 50257)")
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--n-heads", type=int, default=8)
@@ -43,6 +46,16 @@ def main():
                         help="Warmup + cosine decay, applied identically to every arm")
     parser.add_argument("--max-epochs", type=float, default=4.0,
                         help="Refuse a run that would loop the corpus more than this")
+    parser.add_argument("--checkpoint-every", type=int, default=1250,
+                        help="Steps between checkpoints (~11 per run at defaults). "
+                             "Also the most work a crash can cost, since resume "
+                             "restarts from the last one.")
+    parser.add_argument("--ledger", default=str(ROOT / "work" / "kaggle-ledger.jsonl"))
+    parser.add_argument("--run-dir", default=str(ROOT / "runs" / "kaggle"))
+    parser.add_argument("--fresh", action="store_true",
+                        help="Discard existing checkpoints and ledger and start over. "
+                             "Off by default: re-running resumes from the last good "
+                             "checkpoint instead of destroying hours of GPU work.")
     parser.add_argument("--analyze-only", metavar="LEDGER",
                         help="Skip training; run the analysis against an existing "
                              "ledger jsonl (e.g. one downloaded from a Kaggle run)")
@@ -82,7 +95,7 @@ def main():
 
     # Defaults give ~22.4M parameters; override to smoke-test small or to scale up.
     MODEL_CONFIG = dict(
-        vocab_size=50257,
+        vocab_size=args.vocab_size,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -108,24 +121,42 @@ def main():
             print(f"  [FAIL] {failure}")
         raise SystemExit("token_budget_gate: refusing to spend GPU hours on a void run")
 
-    ledger_path = ROOT / "work" / "kaggle-ledger.jsonl"
-    if ledger_path.exists():
-        ledger_path.unlink()
+    ledger_path = Path(args.ledger)
+    run_dir = Path(args.run_dir)
+    if args.fresh:
+        ledger_path.unlink(missing_ok=True)
+        shutil.rmtree(run_dir, ignore_errors=True)
+        print("\n--fresh: discarded previous checkpoints and ledger")
 
-    checkpoint_every = 1250 # 11 checkpoints per run
+    checkpoint_every = args.checkpoint_every
 
     def run_one(name, seed, use_muon):
         run_id = f"gpu-{name}-s{seed}"
-        out_dir = ROOT / "runs" / "kaggle" / f"{name}-s{seed}"
+        out_dir = run_dir / f"{name}-s{seed}"
+
+        # Auto-resume: a crashed or timed-out session costs one checkpoint
+        # interval, not the whole run. Re-running the same command continues.
+        resume = None if args.fresh else resumable_checkpoint(out_dir)
+        ledgered = {e["run_id"] for e in read_entries(ledger_path)}
+        if resume is None and run_id in ledgered:
+            raise SystemExit(
+                f"{run_id} has ledger rows but no readable checkpoint to resume from. "
+                f"Re-running would append duplicate rows for the same token counts. "
+                f"Pass --fresh to discard the previous attempt and start over."
+            )
+
         print(f"\n==========================================")
         print(f"Starting run: {run_id}")
         print(f"Levers: {'Muon' if use_muon else 'baseline'}")
+        if resume is not None:
+            print(f"Resuming from: {resume.name}")
         print(f"==========================================")
-        
+
         start = time.perf_counter()
         result = train(
             str(train_packed),
             str(out_dir),
+            resume=str(resume) if resume is not None else None,
             **MODEL_CONFIG,
             steps=args.steps,
             seed=seed,
