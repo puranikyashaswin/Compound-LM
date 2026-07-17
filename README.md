@@ -30,17 +30,17 @@ Each of these was a green, healthy, fully-ledgered run that measured nothing rea
 ## Quick start
 
 ```bash
-# 1. install the training runtime (interactive; venv required on managed Python)
-python3 -m venv .venv && .venv/bin/python -m pip install pyyaml torch
+# 1. install the training runtime (venv required on managed Python)
+python3 -m venv .venv && .venv/bin/python -m pip install pyyaml numpy torch
 .venv/bin/python scripts/bootstrap.py            # prompts for each missing piece
 
 # 2. run the full protocol end-to-end (real held-out scores + compounding table)
 PYTHONPATH=. .venv/bin/python scripts/run_protocol.py
 
-# 3. audit spine only (no torch needed)
-PYTHONPATH=. python -m pytest
+# 3. run the tests (needs torch: the training and eval paths are exercised for real)
+PYTHONPATH=. .venv/bin/python -m pytest
 ```
 
 Outputs land in `outputs/protocol-report.json` (full evidence) and `outputs/protocol-summary.md`.
-See [the build plan](outputs/compound-lm-build-plan.md) for the full experiment protocol and
-[TRAINING_SETUP.md](TRAINING_SETUP.md) for scaling to the 200M baseline.
+See [the build plan](docs/build-plan.md) for the full experiment protocol and
+[TRAINING_SETUP.md](TRAINING_SETUP.md) for scaling to a real corpus on GPU.

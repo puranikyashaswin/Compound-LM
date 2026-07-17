@@ -7,12 +7,15 @@ name = "compound-lm"
 version = "0.1.0"
 description = "Auditable experiments for compute-efficient language-model training"
 requires-python = ">=3.10"
-dependencies = ["pyyaml>=6.0"]
+# numpy is core, not optional: src/data/binshard.py memory-maps shards with it
+# and the trainer's loader reads every batch through that path.
+dependencies = ["pyyaml>=6.0", "numpy>=1.24"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 training = ["torch>=2.2", "transformers>=4.40", "lm-eval>=0.4.2"]
-data = ["datatrove>=0.4.0", "datasets>=2.18"]
+# tiktoken: scripts/build_corpus.py tokenizes the corpus with the GPT-2 BPE.
+data = ["datatrove>=0.4.0", "datasets>=2.18", "tiktoken>=0.6"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
