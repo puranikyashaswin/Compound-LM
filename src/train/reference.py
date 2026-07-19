@@ -64,22 +64,32 @@ def masked_next_token_loss(logits, ids, document_ids):
 REPLAY_TOLERANCE = 1e-6
 
 
-def _measurements_agree(prior: object, current: object) -> bool:
-    """Compare replayed measurements up to floating-point reduction order."""
+def _measurements_agree(prior: object, current: object,
+                        tolerance: float = REPLAY_TOLERANCE) -> bool:
+    """Compare replayed measurements up to floating-point reduction order.
+
+    ``tolerance`` is the determinism class of the environment. The 1e-6 default
+    is for CPU replay, which is bit-stable up to summation order. fp16 GPU
+    training is not replayable to 1e-6: backward atomics reorder between runs,
+    so a legitimate crash-recovery replay of a few thousand steps lands ~1e-3
+    away. Callers on that path pass a matching tolerance -- the build plan's
+    'replayable vs comparable' distinction, applied per environment.
+    """
     if isinstance(prior, dict) and isinstance(current, dict):
         return prior.keys() == current.keys() and all(
-            _measurements_agree(prior[key], current[key]) for key in prior
+            _measurements_agree(prior[key], current[key], tolerance) for key in prior
         )
     if isinstance(prior, bool) or isinstance(current, bool):
         return prior == current
     if isinstance(prior, (int, float)) and isinstance(current, (int, float)):
         if math.isnan(prior) or math.isnan(current):
             return math.isnan(prior) and math.isnan(current)
-        return abs(prior - current) <= REPLAY_TOLERANCE * max(1.0, abs(prior), abs(current))
+        return abs(prior - current) <= tolerance * max(1.0, abs(prior), abs(current))
     return prior == current
 
 
-def _append_or_verify_replay(ledger_path: str, entry: dict) -> None:
+def _append_or_verify_replay(ledger_path: str, entry: dict,
+                             tolerance: float = REPLAY_TOLERANCE) -> None:
     """Append a ledger row, tolerating an identical deterministic replay.
 
     Resuming restarts from the newest readable checkpoint, which may sit behind
@@ -101,7 +111,7 @@ def _append_or_verify_replay(ledger_path: str, entry: dict) -> None:
         return
     measured = ("final_loss", "eval_scores")
     disagreements = {key: (prior.get(key), entry.get(key)) for key in measured
-                     if not _measurements_agree(prior.get(key), entry.get(key))}
+                     if not _measurements_agree(prior.get(key), entry.get(key), tolerance)}
     if disagreements:
         raise ValueError(
             f"ledger contradiction: {entry['run_id']} at {entry['tokens']} tokens was already "
@@ -172,7 +182,9 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
           keep_checkpoints: int | None = None,
           init_from: str | None = None, model_override=None,
           max_seconds: float | None = None,
-          on_checkpoint=None, grad_accum: int = 1) -> dict:
+          on_checkpoint=None, grad_accum: int = 1,
+          eval_max_batches: int | None = None,
+          replay_tolerance: float = REPLAY_TOLERANCE) -> dict:
     require_torch()
     import torch
     from src.model.registry import build_model
@@ -577,14 +589,15 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
             if heldout_shard:
                 from src.eval.intrinsic import evaluate
                 eval_scores = evaluate(str(checkpoint), heldout_shard, device=device,
-                                     batch_size=eval_batch_size)
+                                       batch_size=eval_batch_size,
+                                       max_batches=eval_max_batches)
                 eval_scores["smoke"] = eval_scores["val_acc"]  # higher-is-better headline score
             
             tokens = (step + 1) * batch_size * rows.sequence_length
             train_flops = 6.0 * n_params * tokens
             
             if ledger_path:
-                _append_or_verify_replay(ledger_path, {
+                _append_or_verify_replay(ledger_path, tolerance=replay_tolerance, entry={
                     "run_id": run_id or f"reference-{config_hash(model.config)[:12]}-{seed}",
                     "config_hash": config_hash(model.config), "commit": "uncommitted",
                     "scale": f"{n_params}p",
@@ -656,7 +669,8 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
               # Loss-scaling overflows are expected under fp16; a high rate
               # means the scale is mistuned and real steps are being lost.
               "overflow_steps": overflow_steps,
-              "overflow_rate": overflow_steps / max(1, steps - start_step),
+              # Overflows happen per OPTIMIZER step; the denominator must match.
+              "overflow_rate": overflow_steps / max(1, (steps - start_step) // grad_accum),
               "parent_checkpoint_hash": parent_checkpoint_hash,
               "stopped_early": stopped_early, "reached_step": final_step}
               

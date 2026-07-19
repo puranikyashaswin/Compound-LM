@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -37,6 +38,7 @@ sys.path.insert(0, str(ROOT))
 # large per-layer tensors, and without this the freed blocks fragment until a
 # large allocation fails despite enough total free memory.
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 REEX1 = "puranikyashaswinsharma/reex-1"
 
@@ -195,13 +197,13 @@ def main() -> None:
                              "model and OOMs the T4.")
     parser.add_argument("--max-hours", type=float, default=8.0,
                         help="Stop and upload before the session limit kills the run")
-    parser.add_argument("--batch-size", type=int, default=2,
-                        help="MICRO-batch. Activation peak is set by this. At 193M with a "
-                             "50257 head and eager attention (the document mask disables "
-                             "flash), batch 8 x seq 1024 needs 13.6GB and OOMs a 14.6GB T4.")
-    parser.add_argument("--grad-accum", type=int, default=4,
-                        help="Micro-batches per optimizer step. batch 2 x accum 4 = the "
-                             "same effective batch 8, at a quarter of the activation peak.")
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="MICRO-batch; the activation peak follows it. batch 8 x seq "
+                             "1024 needs 13.6GB and OOMs a 14.6GB T4; batch 4 needs 8.4GB "
+                             "and keeps the tensor cores fed far better than batch 2.")
+    parser.add_argument("--grad-accum", type=int, default=2,
+                        help="Micro-batches per optimizer step; batch 4 x accum 2 keeps "
+                             "the effective batch at 8.")
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1.5e-4)
     parser.add_argument("--warmup-fraction", type=float, default=0.01)
@@ -209,7 +211,15 @@ def main() -> None:
                         help="Each checkpoint also evaluates the held-out set, "
                              "which at 500 was 18.5%% overhead (4.6h of a 25h job). "
                              "2000 costs 4.6%% and risks 13 minutes on a crash.")
-    parser.add_argument("--milestone-every", type=int, default=5000)
+    parser.add_argument("--milestone-every", type=int, default=50000,
+                        help="Micro-steps between permanent HF-format milestones. Each is "
+                             "0.77GB kept forever; at 5000 a full job would bank ~90 of "
+                             "them (~69GB), brushing HF's private-storage quota.")
+    parser.add_argument("--eval-max-batches", type=int, default=64,
+                        help="Held-out batches scored per in-loop checkpoint (64 x 4 x 1024 "
+                             "= 262K tokens, stable to ~3 decimals). Scoring the full 2.2M "
+                             "tokens each time costs ~5 GPU-hours across the job. The "
+                             "session-end eval always uses the full set.")
     parser.add_argument("--sync-interval-min", type=float, default=25.0)
     parser.add_argument("--corpus-tokens", type=int, default=60_000_000)
     parser.add_argument("--skip-documents", type=int, default=2_400_000,
@@ -240,6 +250,13 @@ def main() -> None:
     print(f"  {tokens_per_step:,} tokens/micro-step x {total_steps:,} steps "
           f"= {total_steps*tokens_per_step/1e9:.2f}B tokens")
 
+    if args.milestone_every and args.milestone_every % args.checkpoint_every:
+        # Milestones fire inside the checkpoint hook, so a cadence that is not
+        # a multiple of checkpoint_every silently never fires.
+        raise SystemExit(
+            f"--milestone-every {args.milestone_every} must be a multiple of "
+            f"--checkpoint-every {args.checkpoint_every}")
+
     from src.train.hf_sync import HubSync
     sync = HubSync(args.hub_repo, min_interval_s=args.sync_interval_min * 60,
                    enabled=not args.no_hub_sync)
@@ -266,6 +283,8 @@ def main() -> None:
             num_key_value_heads=config["n_kv_heads"],
             intermediate_size=config["intermediate_size"],
             max_position_embeddings=config["max_seq_len"],
+            rms_norm_eps=config.get("rms_norm_eps", 1e-5),
+            rope_theta=config.get("rope_theta", 10000.0),
             tie_word_embeddings=True)))
         print(f"   continuing from step {resume_step:,}")
 
@@ -282,15 +301,57 @@ def main() -> None:
     print(f"   train {shards['train']['tokens']:,} | "
           f"heldout {shards['heldout']['tokens']:,} tokens")
 
+    from src.data.budget import check_token_budget
+    budget = check_token_budget(unique_tokens=shards["train"]["tokens"],
+                                steps=total_steps, batch_size=args.batch_size,
+                                sequence_length=args.seq_len, n_params=params)
+    print(f"   budget gate: {budget.status.upper()} "
+          f"(epochs {budget.epochs:.2f}x, {budget.tokens_per_param:.1f} tokens/param)")
+    for warning in budget.warnings:
+        print(f"   [warn] {warning}")
+    if budget.status == "red":
+        for failure in budget.failures:
+            print(f"   [FAIL] {failure}")
+        raise SystemExit("budget_gate: this plan would measure memorization")
+
     print("\n== 4. Train ==")
     ledger = work / "reex15-ledger.jsonl"
+    # The ledger is append-only history; each session must extend it, not
+    # restart it. Without this pull the session begins with an empty file and
+    # its final push OVERWRITES the Hub copy with only its own rows.
+    if sync.enabled and not ledger.exists():
+        try:
+            from huggingface_hub import hf_hub_download
+            fetched = hf_hub_download(sync.repo_id, "ledger/reex15-ledger.jsonl",
+                                      repo_type="model", token=sync.token)
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            ledger.write_bytes(Path(fetched).read_bytes())
+            print(f"   ledger restored from Hub "
+                  f"({sum(1 for _ in ledger.open())} prior rows)")
+        except Exception as error:
+            print(f"   no prior ledger on Hub ({type(error).__name__}); starting one")
+
+    session_t0 = time.time()
+    base_step = resume_step or 0
 
     def on_checkpoint(step: int, checkpoint_path: Path) -> None:
+        # Throughput and ETA from measured progress -- the one number no
+        # pre-flight audit could produce, printed as soon as it exists.
+        done = step - base_step
+        if done > 0:
+            rate = done * tokens_per_step / max(1.0, time.time() - session_t0)
+            remaining_h = (total_steps - step) * tokens_per_step / rate / 3600
+            print(f"[eta] step {step:,}/{total_steps:,} | {rate:,.0f} tok/s | "
+                  f"~{remaining_h:.1f} GPU-hours left "
+                  f"(~{remaining_h / args.max_hours:.1f} more sessions)")
         sync.push_resume_state(checkpoint_path, step=step)
         if args.milestone_every and step % args.milestone_every == 0:
             milestone = work / f"milestone-{step:08d}"
             model.model.save_pretrained(milestone)
             sync.push_milestone(milestone, step=step)
+            # Local copy served its purpose either way; at 0.77GB apiece,
+            # keeping them would eat the session's disk before its time.
+            shutil.rmtree(milestone, ignore_errors=True)
         if ledger.exists():
             sync.push_file(ledger, "ledger/reex15-ledger.jsonl")
 
@@ -307,7 +368,11 @@ def main() -> None:
         batch_size=args.batch_size, lr_schedule=True,
         warmup_fraction=args.warmup_fraction, precision=args.precision,
         grad_clip=args.grad_clip, keep_checkpoints=3, grad_accum=args.grad_accum,
-        eval_batch_size=args.eval_batch_size,
+        eval_batch_size=args.eval_batch_size, eval_max_batches=args.eval_max_batches,
+        # fp16 GPU training is not bit-replayable: backward atomics reorder, so
+        # an honest crash-recovery replay lands ~1e-3 off. CPU default (1e-6)
+        # would call that a contradiction and kill the recovery.
+        replay_tolerance=5e-3,
         ledger_path=str(ledger), run_id="reex-1.5",
         levers_on=["growth"] + (["optimizer"] if args.use_muon else []),
         model_override=model,

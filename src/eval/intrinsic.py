@@ -20,7 +20,7 @@ from src.train.reference import assert_token_ids_in_range
 
 
 def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu",
-             batch_size: int = 32) -> dict[str, Any]:
+             batch_size: int = 32, max_batches: int | None = None) -> dict[str, Any]:
     """Return intrinsic scores; higher ``val_acc`` is better.
 
     Held-out sequences are independent and the document mask is per-sequence,
@@ -37,10 +37,15 @@ def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu",
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
 
-    state = torch.load(checkpoint, map_location=device, weights_only=False)
+    # Loaded to CPU first: a training checkpoint also carries the optimizer's
+    # moment tensors (2/3 of its bytes), and map_location=device would park
+    # those on the GPU for the whole evaluation next to the resident training
+    # model -- pure waste that at 193M params is ~1.5GB of headroom.
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     config = state["config"]
     model = model_from_config(config)
     model.load_state_dict(state["model"])
+    del state
     model.to(device).eval()
     vocab = config["vocab_size"]
 
@@ -53,12 +58,18 @@ def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu",
     total_nll = 0.0
     total_correct = 0
     total_tokens = 0
+    # ``max_batches`` caps the scored prefix. A mid-training curve needs a
+    # stable, comparable score, not the whole held-out set: scoring 2.2M tokens
+    # at every checkpoint of a long run spends GPU-hours re-measuring what a
+    # 260K-token prefix already pins to ~3 decimal places. The cap always takes
+    # the FIRST batches, so every checkpoint scores the identical subset.
+    limit = len(rows) if max_batches is None else min(len(rows), max_batches * batch_size)
     with torch.no_grad():
-        for index in range(0, len(rows), batch_size):
+        for index in range(0, limit, batch_size):
             # Never wrap past the end: rows.batch is cyclic, so a final partial
             # batch would silently re-score sequences from the start of the
             # shard and weight them twice in the mean.
-            take = min(batch_size, len(rows) - index)
+            take = min(batch_size, limit - index)
             batch_ids, batch_docs = rows.batch(index, take)
             ids = torch.tensor(batch_ids, dtype=torch.long, device=device)
             assert_token_ids_in_range(ids, vocab)

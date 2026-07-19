@@ -144,6 +144,13 @@ if torch is not None:
                 "n_kv_heads": getattr(config, "num_key_value_heads", config.num_attention_heads),
                 "intermediate_size": config.intermediate_size,
                 "max_seq_len": config.max_position_embeddings,
+                # Numeric details a rebuild must reproduce exactly. Reex-1 uses
+                # rms_norm_eps 1e-5 while LlamaConfig defaults to 1e-6: close
+                # enough to load, far enough that a session resumed through the
+                # default would be a subtly different function than the one
+                # trained -- the precise drift the lineage rules exist to stop.
+                "rms_norm_eps": float(config.rms_norm_eps),
+                "rope_theta": float(getattr(config, "rope_theta", 10000.0)),
             }
 
         def forward(self, input_ids, document_ids=None):

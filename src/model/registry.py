@@ -53,6 +53,8 @@ def model_from_config(config: dict[str, Any]):
             num_key_value_heads=config.get("n_kv_heads", config["n_heads"]),
             intermediate_size=config.get("intermediate_size", 4 * config["d_model"]),
             max_position_embeddings=config["max_seq_len"],
+            rms_norm_eps=config.get("rms_norm_eps", 1e-5),
+            rope_theta=config.get("rope_theta", 10000.0),
             tie_word_embeddings=True))
         return LlamaProtocolAdapter(llama)
     return build_model(architecture,
