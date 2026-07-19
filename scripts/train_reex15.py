@@ -242,6 +242,11 @@ def main() -> None:
     print("=" * 72)
     tokens_per_step = args.batch_size * args.seq_len
     total_steps = args.total_steps or int(args.target_tokens / tokens_per_step)
+    if total_steps % args.grad_accum:
+        # End the job on an optimizer boundary: a trailing partial accumulation
+        # window would run backward() without ever stepping -- wasted compute
+        # and a final checkpoint whose optimizer never saw its last micro-steps.
+        total_steps += args.grad_accum - total_steps % args.grad_accum
     args.total_steps = total_steps
     effective_batch = args.batch_size * args.grad_accum
     print(f"device {device} | budget {args.max_hours:.1f}h this session")
@@ -250,6 +255,12 @@ def main() -> None:
     print(f"  {tokens_per_step:,} tokens/micro-step x {total_steps:,} steps "
           f"= {total_steps*tokens_per_step/1e9:.2f}B tokens")
 
+    if args.checkpoint_every % args.grad_accum:
+        # Checkpoints land on optimizer-step boundaries; a misaligned cadence
+        # would silently checkpoint at a fraction of the requested rate.
+        raise SystemExit(
+            f"--checkpoint-every {args.checkpoint_every} must be a multiple of "
+            f"--grad-accum {args.grad_accum}")
     if args.milestone_every and args.milestone_every % args.checkpoint_every:
         # Milestones fire inside the checkpoint hook, so a cadence that is not
         # a multiple of checkpoint_every silently never fires.
@@ -320,16 +331,24 @@ def main() -> None:
     # restart it. Without this pull the session begins with an empty file and
     # its final push OVERWRITES the Hub copy with only its own rows.
     if sync.enabled and not ledger.exists():
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
         try:
-            from huggingface_hub import hf_hub_download
             fetched = hf_hub_download(sync.repo_id, "ledger/reex15-ledger.jsonl",
                                       repo_type="model", token=sync.token)
+        except LocalEntryNotFoundError as error:
+            # "Could not reach the Hub" is not "no ledger exists". Starting a
+            # fresh ledger on a network blip would overwrite the recorded
+            # history at the final push -- fail loud and cheap instead.
+            raise SystemExit(f"could not reach the Hub for the prior ledger: {error}. "
+                             f"Re-run rather than overwrite the recorded history.")
+        except EntryNotFoundError:
+            print("   no prior ledger on Hub; starting one")
+        else:
             ledger.parent.mkdir(parents=True, exist_ok=True)
             ledger.write_bytes(Path(fetched).read_bytes())
             print(f"   ledger restored from Hub "
                   f"({sum(1 for _ in ledger.open())} prior rows)")
-        except Exception as error:
-            print(f"   no prior ledger on Hub ({type(error).__name__}); starting one")
 
     session_t0 = time.time()
     base_step = resume_step or 0

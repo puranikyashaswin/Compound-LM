@@ -122,25 +122,49 @@ class HubSync:
             return False
 
     def pull_resume_state(self, local_dir: str | Path) -> tuple[Path | None, int | None]:
-        """Fetch the newest resume state, or (None, None) if the repo has none."""
+        """Fetch the newest resume state, or (None, None) if the repo has none.
+
+        Only a definitive "the file is not on the Hub" starts fresh. Anything
+        else -- DNS failure, timeout, a truncated download -- raises instead.
+        Uploads may be best-effort, but this read is not: if state exists and
+        the pull is mistaken for a fresh start, the run retrains from step 0 and
+        its first push OVERWRITES the real progress. A session that dies in its
+        first minutes with a clear error costs a retry; a session that quietly
+        restarts from zero costs the entire job.
+        """
         if not self.enabled:
             return None, None
+        import json
+
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
+
         try:
-            import json
-
-            from huggingface_hub import hf_hub_download
-
             meta_path = hf_hub_download(self.repo_id, RESUME_META, repo_type="model",
                                         token=self.token)
-            step = int(json.loads(Path(meta_path).read_text())["step"])
+        except LocalEntryNotFoundError as error:
+            # Subclass of EntryNotFoundError, but means "could not reach the
+            # Hub", not "the file is not there" -- so it must be caught first.
+            raise RuntimeError(
+                f"could not reach the Hub to check for resume state on {self.repo_id}: "
+                f"{error}. Refusing to assume a fresh start; re-run when the network is back."
+            ) from error
+        except EntryNotFoundError:
+            print(f"[hub] no resume state on {self.repo_id}; starting fresh")
+            return None, None
+        step = int(json.loads(Path(meta_path).read_text())["step"])
+        try:
             state = hf_hub_download(self.repo_id, RESUME_PATH, repo_type="model",
                                     token=self.token,
                                     local_dir=str(local_dir))
-            print(f"[hub] resuming from step {step} (pulled from {self.repo_id})")
-            return Path(state), step
-        except Exception as error:  # noqa: BLE001
-            print(f"[hub] no resume state found ({type(error).__name__}); starting fresh")
-            return None, None
+        except Exception as error:
+            raise RuntimeError(
+                f"resume state for step {step} exists on {self.repo_id} but could not be "
+                f"fetched ({type(error).__name__}: {error}). Refusing to start fresh over "
+                f"real progress; re-run the session."
+            ) from error
+        print(f"[hub] resuming from step {step} (pulled from {self.repo_id})")
+        return Path(state), step
 
     # -- milestones ----------------------------------------------------
 

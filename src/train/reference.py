@@ -380,11 +380,17 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         start_step = int(state["step"])
         seed = int(state.get("seed", seed))
         if "torch_rng_state" in state:
-            torch.set_rng_state(state["torch_rng_state"])
+            # map_location=device puts this on CUDA; set_rng_state needs a CPU ByteTensor
+            torch.set_rng_state(state["torch_rng_state"].detach().cpu().to(torch.uint8))
         if "python_rng_state" in state:
             random.setstate(state["python_rng_state"])
         if "grad_history" in state:
             grad_history.history = list(state["grad_history"])
+            if grad_history.history:
+                # The health gate judges "the last step that actually updated
+                # the model"; after a resume that is the last recorded norm,
+                # not this session's 0.0 placeholder.
+                last_finite_grad_norm = float(grad_history.history[-1])
         data_position = int(state.get("data_position", (start_step * batch_size) % len(rows)))
 
     model.train()
@@ -393,6 +399,12 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     micro_step = 0
     if grad_accum < 1:
         raise ValueError('grad_accum must be at least 1')
+    if checkpoint_every > 0 and checkpoint_every % grad_accum:
+        raise ValueError(
+            f"checkpoint_every ({checkpoint_every}) must be a multiple of grad_accum "
+            f"({grad_accum}): checkpoints only land on optimizer-step boundaries, so a "
+            f"misaligned cadence silently fires at a fraction of the requested rate"
+        )
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
 
     def _write_checkpoint(payload: dict, target: Path, attempts: int = 3) -> None:
@@ -559,8 +571,17 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         current_loss = float(loss.detach().cpu())
         losses.append(current_loss)
         
+        # The session limit is checked at EVERY optimizer boundary, not only at
+        # cadence checkpoints: stopping costs one off-cadence checkpoint, while
+        # waiting for the next cadence point can overshoot the budget by the
+        # whole interval -- the window in which the platform kills the session
+        # and loses everything since the last upload.
+        out_of_time = (max_seconds is not None
+                       and (time.perf_counter() - started) >= max_seconds)
+        cadence_due = checkpoint_every > 0 and ((step + 1) % checkpoint_every == 0
+                                                or step + 1 == steps)
         # 5. Ledger records score AND cost at every scheduled checkpoint, not only at the end.
-        if checkpoint_every > 0 and ((step + 1) % checkpoint_every == 0 or step + 1 == steps):
+        if cadence_due or out_of_time:
             checkpoint = save_checkpoint(step + 1)
             checkpoint_hash = sha256_bytes(checkpoint.read_bytes())
             
@@ -626,7 +647,7 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
             # A session limit is a deadline, not a failure. Stopping here leaves
             # a saved, ledgered, uploaded checkpoint; being killed mid-step
             # loses everything since the last one.
-            if max_seconds is not None and (time.perf_counter() - started) >= max_seconds:
+            if out_of_time:
                 print(f"[stop] time budget reached at step {step + 1}; "
                       f"state is saved and resumable")
                 stopped_early = True
@@ -669,8 +690,9 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
               # Loss-scaling overflows are expected under fp16; a high rate
               # means the scale is mistuned and real steps are being lost.
               "overflow_steps": overflow_steps,
-              # Overflows happen per OPTIMIZER step; the denominator must match.
-              "overflow_rate": overflow_steps / max(1, (steps - start_step) // grad_accum),
+              # Overflows happen per OPTIMIZER step; the denominator must match,
+              # and must count the steps THIS session ran, not the whole job.
+              "overflow_rate": overflow_steps / max(1, (final_step - start_step) // grad_accum),
               "parent_checkpoint_hash": parent_checkpoint_hash,
               "stopped_early": stopped_early, "reached_step": final_step}
               
