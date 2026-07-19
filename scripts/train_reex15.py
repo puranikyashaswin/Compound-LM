@@ -37,48 +37,79 @@ REEX1 = "puranikyashaswinsharma/reex-1"
 
 
 def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
-                 sequence_length: int, vocab_size: int) -> dict:
-    """Stream fresh FineWeb-Edu, tokenised with Reex-1's own GPT-2 BPE."""
-    from datasets import load_dataset
+                 sequence_length: int, vocab_size: int, heldout_documents: int = 2000) -> dict:
+    """Stream fresh FineWeb-Edu straight into memory-mapped shards.
 
-    from src.data.binshard import convert_jsonl_shard
-    from src.data.pipeline import prepare_documents
+    Deliberately never materialises the corpus. `prepare_documents` keeps every
+    token as a Python int in a list, which at 500M tokens is ~18GB -- more RAM
+    than a Kaggle GPU notebook has -- and additionally writes a ~5.5GB JSONL
+    that would then be converted and discarded. Both are fatal at this scale:
+    one OOMs, the other exhausts the ~19.5GB working directory once checkpoints
+    are added.
+
+    `write_packed_shard` accepts an iterable, so documents are tokenised and
+    handed over one at a time and never all held at once. Peak memory is one
+    document; peak disk is the shard itself.
+
+    Held-out is taken as the FIRST `heldout_documents` documents and training
+    from the rest, so the two are disjoint by construction and the split does
+    not require knowing the corpus length in advance.
+    """
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    from src.data.binshard import write_packed_shard
 
     out_dir.mkdir(parents=True, exist_ok=True)
     marker = out_dir / "corpus.json"
     if marker.exists():
-        print(f"   reusing corpus already built in this session")
+        print("   reusing corpus already built in this session")
         return json.loads(marker.read_text())
 
-    stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
-                          split="train", streaming=True)
-    documents, total, seen = [], 0, 0
-    for record in stream:
-        seen += 1
-        if seen <= skip_documents:
-            continue
-        text = record["text"].strip()
-        if not text:
-            continue
-        documents.append(text)
-        total += len(text.split())
-        if total >= target_tokens:
-            break
-    print(f"   skipped {skip_documents:,} documents Reex-1 already saw; "
-          f"took {len(documents):,} fresh ones")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    counts = {"train": 0, "heldout": 0, "documents": 0, "skipped": 0}
 
-    split = int(len(documents) * 0.98)
+    def documents(which: str):
+        """Yield {document_id, tokens} for one split, tokenising as we go."""
+        stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
+                              split="train", streaming=True)
+        seen = kept = 0
+        for record in stream:
+            seen += 1
+            if seen <= skip_documents:
+                if seen % 500_000 == 0:
+                    print(f"     skipping documents Reex-1 saw: {seen:,}/{skip_documents:,}")
+                continue
+            text = record["text"].strip()
+            if not text:
+                continue
+            kept += 1
+            is_heldout = kept <= heldout_documents
+            if (which == "heldout") != is_heldout:
+                if which == "heldout" and kept > heldout_documents:
+                    return
+                continue
+            ids = tokenizer.encode(text)
+            ids = [i for i in ids if i < vocab_size]
+            if not ids:
+                continue
+            counts[which] += len(ids)
+            counts["documents"] += 1
+            if counts[which] % 25_000_000 < len(ids):
+                print(f"     {which}: {counts[which]/1e6:.0f}M tokens")
+            yield {"document_id": f"fwe-{which}-{kept:08d}", "tokens": ids}
+            if which == "train" and counts["train"] >= target_tokens:
+                return
+
     shards = {}
-    for name, subset in (("train", documents[:split]), ("heldout", documents[split:])):
-        sheet = prepare_documents(subset, source="fineweb-edu",
-                                  shard_id=f"reex15-{name}", output_dir=out_dir,
-                                  tokenizer_id="hf:gpt2", vocab_size=vocab_size,
-                                  near_duplicate=False)
-        prefix = out_dir / f"reex15-{name}-bin"
-        convert_jsonl_shard(out_dir / f"reex15-{name}.jsonl", prefix,
-                            vocab_size=vocab_size, tokenizer_id="hf:gpt2",
-                            sequence_length=sequence_length, source="fineweb-edu")
-        shards[name] = {"packed": str(prefix), "tokens": sheet["token_count"]}
+    for which in ("heldout", "train"):
+        prefix = out_dir / f"reex15-{which}-bin"
+        write_packed_shard(documents(which), prefix, sequence_length=sequence_length,
+                           vocab_size=vocab_size, tokenizer_id="hf:gpt2",
+                           source="fineweb-edu")
+        shards[which] = {"packed": str(prefix), "tokens": counts[which]}
+        print(f"   {which}: {counts[which]:,} tokens -> {prefix.name}")
+
     marker.write_text(json.dumps(shards, indent=2))
     return shards
 
