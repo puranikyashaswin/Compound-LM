@@ -1,0 +1,252 @@
+"""Train Reex-1.5 across many Kaggle sessions, losing nothing between them.
+
+Reex-1.5 is Reex-1 (116M, 12 layers) grown to 24 layers (193M) and pretrained
+further. Reaching Chinchilla for 193M needs ~3.9B tokens against Reex-1's 2B,
+so ~1.9B more -- about 25 GPU-hours at the throughput Reex-1 actually achieved.
+That does not fit one session, so this script is built around being interrupted.
+
+The design point that matters: **a Kaggle committed run starts with an empty
+working directory.** Local checkpoints do not survive to the next session, so a
+disk-based `--resume` finds nothing and silently restarts from zero, quietly
+burning the quota again. The Hub is therefore not a backup but the live state:
+
+    pull resume state from the Hub
+      -> if none, grow Reex-1 and start there
+      -> train until the time budget, checkpointing and uploading as it goes
+      -> stop at a checkpoint boundary and upload
+    (next session repeats, continuing exactly where this one stopped)
+
+Run it identically every session. It works out where it is from the Hub.
+
+The corpus deliberately skips the documents Reex-1 already trained on:
+re-showing them would measure memorisation rather than buy new capability.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+REEX1 = "puranikyashaswinsharma/reex-1"
+
+
+def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
+                 sequence_length: int, vocab_size: int) -> dict:
+    """Stream fresh FineWeb-Edu, tokenised with Reex-1's own GPT-2 BPE."""
+    from datasets import load_dataset
+
+    from src.data.binshard import convert_jsonl_shard
+    from src.data.pipeline import prepare_documents
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    marker = out_dir / "corpus.json"
+    if marker.exists():
+        print(f"   reusing corpus already built in this session")
+        return json.loads(marker.read_text())
+
+    stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
+                          split="train", streaming=True)
+    documents, total, seen = [], 0, 0
+    for record in stream:
+        seen += 1
+        if seen <= skip_documents:
+            continue
+        text = record["text"].strip()
+        if not text:
+            continue
+        documents.append(text)
+        total += len(text.split())
+        if total >= target_tokens:
+            break
+    print(f"   skipped {skip_documents:,} documents Reex-1 already saw; "
+          f"took {len(documents):,} fresh ones")
+
+    split = int(len(documents) * 0.98)
+    shards = {}
+    for name, subset in (("train", documents[:split]), ("heldout", documents[split:])):
+        sheet = prepare_documents(subset, source="fineweb-edu",
+                                  shard_id=f"reex15-{name}", output_dir=out_dir,
+                                  tokenizer_id="hf:gpt2", vocab_size=vocab_size,
+                                  near_duplicate=False)
+        prefix = out_dir / f"reex15-{name}-bin"
+        convert_jsonl_shard(out_dir / f"reex15-{name}.jsonl", prefix,
+                            vocab_size=vocab_size, tokenizer_id="hf:gpt2",
+                            sequence_length=sequence_length, source="fineweb-edu")
+        shards[name] = {"packed": str(prefix), "tokens": sheet["token_count"]}
+    marker.write_text(json.dumps(shards, indent=2))
+    return shards
+
+
+def build_reex15(donor: str, subfolder: str, to_layers: int):
+    """Grow Reex-1 and gate on exact equivalence before anything else."""
+    import torch
+    from transformers import LlamaForCausalLM
+
+    from src.model.llama_adapter import LlamaProtocolAdapter, grow_llama_depth
+
+    load = {"subfolder": subfolder} if subfolder else {}
+    base = LlamaForCausalLM.from_pretrained(donor, dtype=torch.float32, **load).eval()
+    grown, report = grow_llama_depth(base, to_layers=to_layers, mode="zero_init")
+
+    ids = torch.randint(0, base.config.vocab_size, (2, 64))
+    with torch.no_grad():
+        difference = (base(input_ids=ids).logits
+                      - grown.eval()(input_ids=ids).logits).abs().max().item()
+    if difference > 1e-4:
+        raise SystemExit(
+            f"GROWTH GATE FAILED: grown model differs from Reex-1 by {difference:.3e}. "
+            f"Training from here would discard the 2B tokens already spent."
+        )
+    print(f"   equivalence gate PASS (max logit diff {difference:.3e}) -- "
+          f"Reex-1.5 starts exactly where Reex-1 finished")
+    return LlamaProtocolAdapter(grown), report
+
+
+def main() -> None:
+    import torch
+
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--hub-repo", required=True,
+                        help="Where Reex-1.5 lives, e.g. you/reex-1.5")
+    parser.add_argument("--donor", default=REEX1)
+    parser.add_argument("--donor-subfolder", default="hf_format")
+    parser.add_argument("--to-layers", type=int, default=24)
+    parser.add_argument("--total-steps", type=int, default=30000,
+                        help="Steps for the WHOLE job across every session; the LR "
+                             "schedule spans this, so keep it fixed between sessions")
+    parser.add_argument("--max-hours", type=float, default=8.0,
+                        help="Stop and upload before the session limit kills the run")
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--learning-rate", type=float, default=1.5e-4)
+    parser.add_argument("--warmup-fraction", type=float, default=0.01)
+    parser.add_argument("--checkpoint-every", type=int, default=500)
+    parser.add_argument("--milestone-every", type=int, default=5000)
+    parser.add_argument("--sync-interval-min", type=float, default=25.0)
+    parser.add_argument("--corpus-tokens", type=int, default=60_000_000)
+    parser.add_argument("--skip-documents", type=int, default=2_400_000,
+                        help="Documents Reex-1 consumed; skipped so this trains on new text")
+    parser.add_argument("--use-muon", action="store_true")
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--precision", default="auto")
+    parser.add_argument("--no-hub-sync", action="store_true")
+    parser.add_argument("--work-dir", default=str(ROOT / "runs" / "reex-1.5"))
+    args = parser.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else (
+        "mps" if torch.backends.mps.is_available() else "cpu")
+    work = Path(args.work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+
+    print("=" * 72)
+    print("REEX-1.5 -- resumable multi-session pretraining")
+    print("=" * 72)
+    print(f"device {device} | budget {args.max_hours:.1f}h this session "
+          f"| {args.total_steps:,} steps total")
+
+    from src.train.hf_sync import HubSync
+    sync = HubSync(args.hub_repo, min_interval_s=args.sync_interval_min * 60,
+                   enabled=not args.no_hub_sync)
+
+    print("\n== 1. Where are we? ==")
+    resume_path, resume_step = sync.pull_resume_state(work)
+
+    print("\n== 2. Model ==")
+    if resume_path is None:
+        print(f"   first session: growing {args.donor} to {args.to_layers} layers")
+        model, growth = build_reex15(args.donor, args.donor_subfolder, args.to_layers)
+        print(f"   growth: {growth.as_dict()}")
+    else:
+        # Rebuild the same shape; train() loads the weights from the resume state.
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        from src.model.llama_adapter import LlamaProtocolAdapter
+        state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        config = state["config"]
+        model = LlamaProtocolAdapter(LlamaForCausalLM(LlamaConfig(
+            vocab_size=config["vocab_size"], hidden_size=config["d_model"],
+            num_hidden_layers=config["n_layers"],
+            num_attention_heads=config["n_heads"],
+            num_key_value_heads=config["n_kv_heads"],
+            intermediate_size=config["intermediate_size"],
+            max_position_embeddings=config["max_seq_len"],
+            tie_word_embeddings=True)))
+        print(f"   continuing from step {resume_step:,}")
+
+    config = model.config
+    params = sum({id(p): p.numel() for p in model.parameters()}.values())
+    print(f"   {params:,} parameters, {config['n_layers']} layers, "
+          f"{config['n_heads']}q/{config['n_kv_heads']}kv heads")
+
+    print("\n== 3. Corpus (fresh text only) ==")
+    shards = build_corpus(work / "corpus", target_tokens=args.corpus_tokens,
+                          skip_documents=args.skip_documents,
+                          sequence_length=args.seq_len,
+                          vocab_size=config["vocab_size"])
+    print(f"   train {shards['train']['tokens']:,} | "
+          f"heldout {shards['heldout']['tokens']:,} tokens")
+
+    print("\n== 4. Train ==")
+    ledger = work / "reex15-ledger.jsonl"
+
+    def on_checkpoint(step: int, checkpoint_path: Path) -> None:
+        sync.push_resume_state(checkpoint_path, step=step)
+        if args.milestone_every and step % args.milestone_every == 0:
+            milestone = work / f"milestone-{step:08d}"
+            model.model.save_pretrained(milestone)
+            sync.push_milestone(milestone, step=step)
+        if ledger.exists():
+            sync.push_file(ledger, "ledger/reex15-ledger.jsonl")
+
+    from src.train.reference import train
+
+    elapsed = time.time() - started
+    result = train(
+        shards["train"]["packed"], str(work / "run"),
+        vocab_size=config["vocab_size"], d_model=config["d_model"],
+        n_layers=config["n_layers"], n_heads=config["n_heads"],
+        steps=args.total_steps, learning_rate=args.learning_rate, seed=17,
+        device=device, checkpoint_every=args.checkpoint_every,
+        heldout_shard=shards["heldout"]["packed"], use_muon=args.use_muon,
+        batch_size=args.batch_size, lr_schedule=True,
+        warmup_fraction=args.warmup_fraction, precision=args.precision,
+        grad_clip=args.grad_clip, keep_checkpoints=3,
+        ledger_path=str(ledger), run_id="reex-1.5",
+        levers_on=["growth"] + (["optimizer"] if args.use_muon else []),
+        model_override=model,
+        resume=str(resume_path) if resume_path else None,
+        max_seconds=max(60.0, args.max_hours * 3600 - elapsed),
+        on_checkpoint=on_checkpoint)
+
+    print("\n== 5. Session summary ==")
+    print(f"   reached step  : {result['reached_step']:,} / {args.total_steps:,}")
+    print(f"   final loss    : {result['final_loss']:.4f}")
+    if result.get("eval_scores"):
+        print(f"   held-out acc  : {result['eval_scores']['val_acc']:.4f}  "
+              f"nll {result['eval_scores']['val_nll']:.4f}")
+    print(f"   health        : {result['health']['status']}")
+    print(f"   fp16 overflows: {result['overflow_steps']} "
+          f"({result['overflow_rate']:.2%} of steps)")
+
+    final = Path(result["checkpoint"])
+    sync.push_resume_state(final, step=result["reached_step"], force=True)
+    print(f"   hub uploads   : {sync.status.uploads} "
+          f"({sync.status.bytes_sent/1e9:.1f} GB), failures {sync.status.failures}")
+
+    if result["stopped_early"]:
+        print("\n   TIME BUDGET REACHED -- state is on the Hub.")
+        print("   Re-run this identical command in a new session to continue.")
+    else:
+        print("\n   TRAINING COMPLETE.")
+
+
+if __name__ == "__main__":
+    main()

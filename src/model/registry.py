@@ -38,7 +38,24 @@ def build_model(architecture: str, *, vocab_size: int, d_model: int,
 
 def model_from_config(config: dict[str, Any]):
     """Rebuild the model a checkpoint's config describes."""
-    return build_model(config.get("architecture", DEFAULT_ARCHITECTURE),
+    architecture = config.get("architecture", DEFAULT_ARCHITECTURE)
+    if architecture == "llama-hf":
+        # Reconstructed from the recorded config rather than downloaded, so an
+        # evaluation never depends on network access or on an upstream repo
+        # still existing. Weights are loaded by the caller from the checkpoint.
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        from src.model.llama_adapter import LlamaProtocolAdapter
+        llama = LlamaForCausalLM(LlamaConfig(
+            vocab_size=config["vocab_size"], hidden_size=config["d_model"],
+            num_hidden_layers=config["n_layers"],
+            num_attention_heads=config["n_heads"],
+            num_key_value_heads=config.get("n_kv_heads", config["n_heads"]),
+            intermediate_size=config.get("intermediate_size", 4 * config["d_model"]),
+            max_position_embeddings=config["max_seq_len"],
+            tie_word_embeddings=True))
+        return LlamaProtocolAdapter(llama)
+    return build_model(architecture,
                        vocab_size=config["vocab_size"], d_model=config["d_model"],
                        n_layers=config["n_layers"], n_heads=config["n_heads"],
                        max_seq_len=config["max_seq_len"])

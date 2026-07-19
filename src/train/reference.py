@@ -170,7 +170,9 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
           compile_model: bool = False, grad_clip: float | None = None,
           weight_decay: float = 0.01, eval_batch_size: int = 32,
           keep_checkpoints: int | None = None,
-          init_from: str | None = None) -> dict:
+          init_from: str | None = None, model_override=None,
+          max_seconds: float | None = None,
+          on_checkpoint=None) -> dict:
     require_torch()
     import torch
     from src.model.registry import build_model
@@ -185,9 +187,26 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     random.seed(seed); torch.manual_seed(seed)
     rows = open_shard(shard)
 
-    model = build_model(architecture, vocab_size=vocab_size, d_model=d_model,
-                        n_layers=n_layers, n_heads=n_heads,
-                        max_seq_len=rows.sequence_length)
+    if model_override is not None:
+        # A model this framework does not implement -- Reex-1.5 is a wrapped
+        # LlamaForCausalLM, whose grouped-query attention ReferenceLM/ReexLM
+        # cannot express. The protocol (health gates, ledger, capability-at-cost,
+        # precision policy, Muon partition, resume) is architecture-agnostic and
+        # applies unchanged; only construction differs.
+        model = model_override
+        if not hasattr(model, "config"):
+            raise ValueError("model_override must expose a .config dict for provenance")
+        declared = model.config.get("vocab_size")
+        if declared is not None and int(declared) != vocab_size:
+            raise ValueError(
+                f"model_override has vocab_size {declared} but the run declares "
+                f"{vocab_size}; the token-range check would then be meaningless"
+            )
+        architecture = model.config.get("architecture", architecture)
+    else:
+        model = build_model(architecture, vocab_size=vocab_size, d_model=d_model,
+                            n_layers=n_layers, n_heads=n_heads,
+                            max_seq_len=rows.sequence_length)
     model.to(device)
 
     # Systems lever: same mathematics, fewer seconds per step. Default fp32
@@ -358,6 +377,7 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
 
     model.train()
     started = time.perf_counter()
+    stopped_early = False
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
 
     def _write_checkpoint(payload: dict, target: Path, attempts: int = 3) -> None:
@@ -566,8 +586,24 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
             if keep_checkpoints is not None:
                 prune_checkpoints(keep_checkpoints)
 
-    # Prepare final result dictionary
-    final_step = steps
+            # Hook for durable off-machine state. Runs at a checkpoint boundary,
+            # where the on-disk state is complete and consistent.
+            if on_checkpoint is not None:
+                on_checkpoint(step + 1, checkpoint)
+
+            # A session limit is a deadline, not a failure. Stopping here leaves
+            # a saved, ledgered, uploaded checkpoint; being killed mid-step
+            # loses everything since the last one.
+            if max_seconds is not None and (time.perf_counter() - started) >= max_seconds:
+                print(f"[stop] time budget reached at step {step + 1}; "
+                      f"state is saved and resumable")
+                stopped_early = True
+                break
+
+    # Prepare final result dictionary. A time-limited stop reports the step it
+    # actually reached, so the caller can resume from there rather than assume
+    # the run finished.
+    final_step = (step + 1) if stopped_early else steps
     checkpoint_path = out / f"checkpoint-{final_step:08d}.pt"
     if not checkpoint_path.exists():
         checkpoint = save_checkpoint(final_step)
@@ -602,7 +638,8 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
               # means the scale is mistuned and real steps are being lost.
               "overflow_steps": overflow_steps,
               "overflow_rate": overflow_steps / max(1, steps - start_step),
-              "parent_checkpoint_hash": parent_checkpoint_hash}
+              "parent_checkpoint_hash": parent_checkpoint_hash,
+              "stopped_early": stopped_early, "reached_step": final_step}
               
     return result
 
