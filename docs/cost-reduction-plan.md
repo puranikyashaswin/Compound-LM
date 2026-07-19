@@ -2,7 +2,8 @@
 
 ## Bugs this audit found in its own code
 
-Three, all of which would have produced confident wrong numbers:
+Five. The first three would each have produced confident wrong numbers; the
+last two wasted real time on a live GPU session.
 
 1. **Silent token remapping.** The trainer did `ids % vocab_size`. Correct for
    the hash-based fallback tokenizer (whose ids are 32-bit hashes), but it was
@@ -23,6 +24,23 @@ Three, all of which would have produced confident wrong numbers:
    seconds-per-step is pure noise. On this CPU it was 5.6–15%, larger than
    several levers. The protocol now uses that pair as a timing control and
    prints `noisy` instead of a number when it fails.
+
+4. **Tests depended on gitignored build artifacts.** `data/protocol-v1/*.jsonl`
+   is in `.gitignore`, so eight tests passed locally (where earlier protocol
+   runs had left the files behind) and failed on every fresh clone — which is
+   what happened on Kaggle. A session-scoped `conftest.py` fixture now builds
+   them on demand, and the suite is verified against a simulated clean
+   checkout with the shards deleted.
+
+5. **Corpus preparation cost 21 minutes for 20M tokens.** Two avoidable costs:
+   the SimHash near-duplicate filter, which loops 64 times per word and is 88%
+   of preparation time (and is redundant on FineWeb-Edu, already deduplicated
+   upstream), and a packed-JSONL round trip storing every token as text then
+   loading it as a Python int (~1.4 GB for 20M tokens). The memory-mapped
+   `binshard` format existed and was unused. Both defaults flipped: **4.9×
+   faster preparation, half the disk, identical token counts and identical
+   multipliers** — verified by running the same experiment both ways
+   (accuracy 0.4693/0.4677 and Muon 1.336× on both paths).
 
 ## Verified on a Tesla T4 (Kaggle, free tier)
 

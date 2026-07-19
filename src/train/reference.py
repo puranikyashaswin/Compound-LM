@@ -168,7 +168,8 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
           warmup_fraction: float = 0.01, min_lr_fraction: float = 0.1,
           architecture: str = "reference-v1", precision: str = "fp32",
           compile_model: bool = False, grad_clip: float | None = None,
-          weight_decay: float = 0.01, eval_batch_size: int = 32) -> dict:
+          weight_decay: float = 0.01, eval_batch_size: int = 32,
+          keep_checkpoints: int | None = None) -> dict:
     require_torch()
     import torch
     from src.model.registry import build_model
@@ -241,6 +242,9 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     start_step = 0
     data_position = 0
     grad_history = RollingMedian(window=100)
+    overflow_steps = 0
+    last_finite_grad_norm = 0.0
+    spike_streak = 0
 
     if resume:
         state = torch.load(resume, map_location=device, weights_only=False)
@@ -316,6 +320,29 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
                     ) from error
                 time.sleep(0.5 * (attempt + 1))
 
+    def prune_checkpoints(keep: int) -> int:
+        """Delete all but the newest ``keep`` checkpoints. Returns bytes freed.
+
+        A checkpoint carries the model plus AdamW's two moment tensors, so it is
+        ~12 bytes per parameter: 268MB for a 22M-parameter model, and 12.8GB
+        across a four-arm matrix with twelve checkpoints each -- which does not
+        fit in a Kaggle session's ~19.5GB working directory. The capability
+        curve is read from the ledger, not from these files, so only the newest
+        are needed, and only for resume.
+
+        Keeps more than one deliberately: a crash during ``torch.save`` leaves a
+        truncated newest file, and ``resumable_checkpoint`` falls back to the
+        previous one. Pruning to a single checkpoint would remove that fallback.
+        """
+        if keep < 2:
+            raise ValueError("keep_checkpoints must be at least 2 to preserve the resume fallback")
+        existing = sorted(out.glob("checkpoint-*.pt"))
+        freed = 0
+        for stale in existing[:-keep]:
+            freed += stale.stat().st_size
+            stale.unlink(missing_ok=True)
+        return freed
+
     def save_checkpoint(step: int) -> Path:
         target = out / f"checkpoint-{step:08d}.pt"
         payload = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
@@ -387,7 +414,21 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         # stable -- but it changes the numbers, so it stays opt-in.
         grad_norm = float(torch.nn.utils.clip_grad_norm_(
             model.parameters(), grad_clip if grad_clip is not None else 1e9).detach().cpu())
-        grad_history.add(grad_norm)
+
+        # A non-finite norm here means loss scaling overflowed. GradScaler will
+        # skip this step and halve the scale -- the mechanism working as
+        # designed, and routine in fp16 (it also overflows deliberately when it
+        # probes for a larger scale every growth_interval steps). Such a step
+        # updates nothing, so it must not enter the gradient history nor be
+        # judged by the health gate: doing so turns an expected event into
+        # `red`, and `red` raises, destroying the whole run. Counted instead,
+        # so a pathological overflow rate is still visible.
+        step_overflowed = not math.isfinite(grad_norm)
+        if step_overflowed:
+            overflow_steps += 1
+        else:
+            grad_history.add(grad_norm)
+            last_finite_grad_norm = grad_norm
 
         if scaler.is_enabled():
             scaler.step(optimizer)
@@ -407,11 +448,26 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
             checkpoint = save_checkpoint(step + 1)
             checkpoint_hash = sha256_bytes(checkpoint.read_bytes())
             
-            # Check checkpoint health. If health is red, raise ValueError to terminate training.
-            report = check_checkpoint(loss=current_loss, grad_norm=grad_norm, median_grad_norm=grad_history.median(),
-                                      checkpoint_hash=checkpoint_hash, provenance_ok=True)
+            # Judge the last step that actually updated the model. An overflowed
+            # step changed nothing, so grading the checkpoint on its inf norm
+            # would halt a healthy run for doing exactly what loss scaling is for.
+            judged_grad_norm = last_finite_grad_norm if step_overflowed else grad_norm
+            median = grad_history.median()
+            if median > 0 and judged_grad_norm > 3.0 * median and judged_grad_norm > 0.01:
+                spike_streak += 1
+            else:
+                spike_streak = 0
+            report = check_checkpoint(loss=current_loss, grad_norm=judged_grad_norm,
+                                      median_grad_norm=median,
+                                      checkpoint_hash=checkpoint_hash, provenance_ok=True,
+                                      consecutive_spikes=max(1, spike_streak))
             if report.status == "red":
-                raise ValueError(f"health check failed: {report.failures}")
+                raise ValueError(
+                    f"health check failed: {report.failures} "
+                    f"(loss={current_loss:.4f} grad_norm={judged_grad_norm:.4f} "
+                    f"median={median:.4f} spike_streak={spike_streak} "
+                    f"overflow_steps={overflow_steps})"
+                )
                 
             eval_scores: dict = {}
             if heldout_shard:
@@ -436,7 +492,13 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
                     "notes": f"checkpoint-{step+1}", "checkpoint_hash": checkpoint_hash,
                     "health": report.as_dict(), "resume": resume,
                     "optimizer_groups": optimizer_groups,
+                    "overflow_steps": overflow_steps,
                 })
+
+            # Pruned only after the row is ledgered, so a checkpoint is never
+            # deleted before the measurement it carries has been recorded.
+            if keep_checkpoints is not None:
+                prune_checkpoints(keep_checkpoints)
 
     # Prepare final result dictionary
     final_step = steps
@@ -469,7 +531,11 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
               "use_muon": use_muon, "eval_scores": eval_scores, "train_flops": train_flops,
               "architecture": architecture, "systems": resolved.as_dict(),
               "grad_clip": grad_clip, "weight_decay": weight_decay,
-              "eval_batch_size": eval_batch_size}
+              "eval_batch_size": eval_batch_size,
+              # Loss-scaling overflows are expected under fp16; a high rate
+              # means the scale is mistuned and real steps are being lost.
+              "overflow_steps": overflow_steps,
+              "overflow_rate": overflow_steps / max(1, steps - start_step)}
               
     return result
 

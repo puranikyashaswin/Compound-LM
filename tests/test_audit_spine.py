@@ -24,10 +24,43 @@ def test_ledger_required_fields_and_duplicate_protection(tmp_path):
         append_entry(path, row)
 
 
-def test_health_red_on_gradient_spike():
+def test_single_gradient_spike_warns_but_does_not_halt():
+    """`red` halts the run, so one noisy step must not earn it.
+
+    This assertion used to require `red` for a single spike. That is wrong for
+    a check that sees one step against a rolling median: individual steps in
+    language-model training routinely exceed 3x the recent median while the run
+    is perfectly healthy, and halting destroys hours of GPU time. The spike is
+    still recorded -- as a warning, which the build plan keeps visible in the
+    ledger.
+    """
     report = check_checkpoint(loss=1, grad_norm=4, median_grad_norm=1, checkpoint_hash="x")
+    assert report.status == "amber"
+    assert "gradient_norm_spike" in report.warnings
+    assert not report.failures
+
+
+def test_sustained_gradient_spikes_still_halt():
+    """A streak is what divergence actually looks like."""
+    report = check_checkpoint(loss=1, grad_norm=4, median_grad_norm=1, checkpoint_hash="x",
+                              consecutive_spikes=3)
     assert report.status == "red"
     assert "gradient_norm_spike" in report.failures
+
+
+def test_non_finite_metrics_still_halt():
+    for bad in (float("inf"), float("nan")):
+        report = check_checkpoint(loss=1, grad_norm=bad, median_grad_norm=1,
+                                  checkpoint_hash="x")
+        assert report.status == "red"
+        assert "non_finite_tensor_or_metric" in report.failures
+
+
+def test_a_non_finite_norm_is_not_also_reported_as_a_spike():
+    """inf > 3*median is arithmetically true but says nothing about a spike."""
+    report = check_checkpoint(loss=1, grad_norm=float("inf"), median_grad_norm=1,
+                              checkpoint_hash="x")
+    assert report.failures == ["non_finite_tensor_or_metric"]
 
 
 def test_dummy_trainer_is_replayable(tmp_path):

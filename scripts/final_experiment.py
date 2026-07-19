@@ -42,40 +42,74 @@ DEDUP_HEADROOM = 1.10  # documents dropped as exact/near duplicates
 
 def build_corpus(out_dir: Path, *, target_tokens: int, vocab_size: int,
                  sequence_length: int, seed: int, proxy_vocabulary: int = 8000,
-                 proxy_successors: int = 4) -> dict:
+                 proxy_successors: int = 4, near_duplicate: bool = False,
+                 binary_shards: bool = True, allow_download: bool = True,
+                 tokenizer_id: str = "fallback-v1") -> dict:
     """Materialize a real corpus, preferring FineWeb-Edu, else a fallback.
 
     The fallback is deliberately *not* a trivial cycle: it is a procedurally
     generated text with long-range structure and a large vocabulary, so the
     task cannot be solved by memorizing a short rule. It is still a proxy, and
     the report labels it as one.
+
+    Two defaults here are about cost, and both were chosen after a 21-minute
+    corpus build on Kaggle:
+
+    ``near_duplicate=False`` skips the SimHash fingerprint, which is 88% of
+    preparation time (it loops 64 times per word). FineWeb-Edu is already
+    deduplicated upstream, so paying for it again buys nothing. Exact-duplicate
+    rejection still runs -- it is a cheap hash-set lookup.
+
+    ``binary_shards=True`` writes memory-mapped shards instead of packed JSONL.
+    The JSONL loader holds every token as a Python int (~1.4GB for 20M tokens)
+    and has to be written and read back as text. `tests/test_binshard_training.py`
+    pins that both formats produce identical loss curves, so this is a cost
+    change, not a science change.
     """
+    from src.data.binshard import convert_jsonl_shard
     from src.data.packing import pack_shard
     from src.data.pipeline import prepare_documents
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    documents, source = _load_documents(target_tokens, seed,
-                                        proxy_vocabulary, proxy_successors)
+    documents, source = _load_documents(target_tokens, seed, proxy_vocabulary,
+                                        proxy_successors, allow_download)
 
     split = int(len(documents) * TRAIN_FRACTION)
     shards = {}
     for name, subset in (("train", documents[:split]), ("heldout", documents[split:])):
         sheet = prepare_documents(subset, source=source, shard_id=f"final-{name}",
-                                  output_dir=out_dir, tokenizer_id="fallback-v1",
-                                  vocab_size=vocab_size)
-        packed = out_dir / f"final-{name}-packed.jsonl"
-        pack_shard(out_dir / f"final-{name}.jsonl", packed,
-                   sequence_length=sequence_length)
-        shards[name] = {"packed": str(packed), "tokens": sheet["token_count"],
+                                  output_dir=out_dir, tokenizer_id=tokenizer_id,
+                                  vocab_size=vocab_size, near_duplicate=near_duplicate)
+        documents_jsonl = out_dir / f"final-{name}.jsonl"
+        if binary_shards:
+            prefix = out_dir / f"final-{name}-bin"
+            convert_jsonl_shard(documents_jsonl, prefix, vocab_size=vocab_size,
+                                tokenizer_id=tokenizer_id,
+                                sequence_length=sequence_length, source=source)
+            packed = str(prefix)
+        else:
+            packed = str(out_dir / f"final-{name}-packed.jsonl")
+            pack_shard(documents_jsonl, Path(packed), sequence_length=sequence_length)
+        shards[name] = {"packed": packed, "tokens": sheet["token_count"],
                         "documents": sheet["document_count_kept"]}
     shards["source"] = source
+    shards["format"] = "binshard" if binary_shards else "packed-jsonl"
+    shards["tokenizer_id"] = tokenizer_id
+    shards["near_duplicate_filter"] = near_duplicate
     return shards
 
 
 def _load_documents(target_tokens: int, seed: int,
                     proxy_vocabulary: int = 8000,
-                    proxy_successors: int = 4) -> tuple[list[str], str]:
-    """Real text if the environment allows it, else a structured proxy."""
+                    proxy_successors: int = 4,
+                    allow_download: bool = True) -> tuple[list[str], str]:
+    """Real text if the environment allows it, else a structured proxy.
+
+    ``allow_download=False`` forces the proxy. Tests use it so the suite never
+    depends on network access or on a dataset that may change upstream.
+    """
+    if not allow_download:
+        return _proxy_documents(target_tokens, seed, proxy_vocabulary, proxy_successors)
     try:
         from datasets import load_dataset
         stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
@@ -94,7 +128,11 @@ def _load_documents(target_tokens: int, seed: int,
             return documents, "fineweb-edu"
     except Exception as error:
         print(f"   FineWeb-Edu unavailable ({type(error).__name__}); using proxy corpus")
+    return _proxy_documents(target_tokens, seed, proxy_vocabulary, proxy_successors)
 
+
+def _proxy_documents(target_tokens: int, seed: int, proxy_vocabulary: int,
+                     proxy_successors: int) -> tuple[list[str], str]:
     # Proxy: a word-level Markov text over a large vocabulary. Successor
     # prediction is learnable but not memorizable from a short rule, and
     # held-out documents are generated from the same process with unseen seeds.
@@ -124,7 +162,7 @@ def _load_documents(target_tokens: int, seed: int,
 
 def run_arm(name, *, shard, heldout, seed, use_muon, levers, model_config,
             steps, batch_size, sequence_length, device, precision, checkpoint_every,
-            grad_clip, ledger, run_dir):
+            grad_clip, ledger, run_dir, keep_checkpoints):
     from src.eval.intrinsic import evaluate
     from src.train.reference import resumable_checkpoint, train
 
@@ -139,22 +177,55 @@ def run_arm(name, *, shard, heldout, seed, use_muon, levers, model_config,
                    heldout_shard=heldout, use_muon=use_muon, levers_on=levers,
                    batch_size=batch_size, precision=precision, lr_schedule=True,
                    grad_clip=grad_clip, ledger_path=str(ledger), run_id=name,
-                   resume=str(resume) if resume else None)
+                   resume=str(resume) if resume else None,
+                   keep_checkpoints=keep_checkpoints)
     wall_clock = time.perf_counter() - started
 
-    curve = []
+    # Build the capability curve from the ledger rather than re-evaluating every
+    # checkpoint. `train` already scored each one and wrote it to the ledger, so
+    # recomputing here doubled the evaluation cost of the whole experiment for
+    # identical numbers. Reading the ledger is also what the build plan asks for:
+    # published tables derive from ledger records, not from a parallel path that
+    # could silently disagree with them.
+    from src.ledger.writer import read_entries
+
     n_params = _count_params(model_config, sequence_length)
-    for checkpoint in sorted(out_dir.glob("checkpoint-*.pt")):
-        step = int(checkpoint.stem.split("-")[1])
-        scores = evaluate(str(checkpoint), heldout, device=device)
-        curve.append({"step": step,
-                      "cost": 6 * n_params * sequence_length * batch_size * step,
-                      "score": scores["val_acc"], "val_nll": scores["val_nll"]})
+    curve = []
+    for row in read_entries(str(ledger)):
+        if row.get("run_id") != name:
+            continue
+        scores = row.get("eval_scores") or {}
+        if "val_acc" not in scores:
+            continue
+        curve.append({"step": row["tokens"] // (sequence_length * batch_size),
+                      "cost": 6 * n_params * row["tokens"],
+                      "score": scores["val_acc"], "val_nll": scores.get("val_nll")})
+    curve.sort(key=lambda point: point["step"])
+    if not curve:
+        # No ledgered scores: fall back to scoring the checkpoints directly so a
+        # ledger problem degrades to slow rather than to no result at all.
+        for checkpoint in sorted(out_dir.glob("checkpoint-*.pt")):
+            step = int(checkpoint.stem.split("-")[1])
+            scores = evaluate(str(checkpoint), heldout, device=device)
+            curve.append({"step": step,
+                          "cost": 6 * n_params * sequence_length * batch_size * step,
+                          "score": scores["val_acc"], "val_nll": scores["val_nll"]})
     return {"name": name, "seed": seed, "levers": levers,
             "final": result["eval_scores"], "health": result["health"],
             "curve": curve, "wall_clock_s": wall_clock,
             "seconds_per_step": wall_clock / max(1, steps),
             "checkpoint_hash": result["checkpoint_hash"]}
+
+
+def _write_evidence(path: str, payload: dict) -> None:
+    """Persist evidence, tolerating types json does not know.
+
+    ``default=str`` matters: a numpy scalar or a Path leaking into the payload
+    would otherwise raise at the very end and discard the whole run's record.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
 
 
 def _count_params(model_config: dict, sequence_length: int) -> int:
@@ -188,6 +259,24 @@ def main() -> None:
                              "is unreachable; smaller makes the task learnable sooner")
     parser.add_argument("--proxy-successors", type=int, default=4,
                         help="Followers per word; ceiling accuracy is 1/this")
+    parser.add_argument("--near-duplicate", action="store_true",
+                        help="Run the SimHash near-duplicate filter. It is 88%% of "
+                             "corpus-prep time and redundant on FineWeb-Edu, which is "
+                             "already deduplicated. Exact-duplicate rejection always runs.")
+    parser.add_argument("--keep-checkpoints", type=int, default=3,
+                        help="Checkpoints retained per arm. Each is ~12 bytes/param "
+                             "(268MB at 22M params), and 48 of them exceed Kaggle's "
+                             "~19.5GB working directory. The capability curve is read "
+                             "from the ledger, so older files are only needed for resume.")
+    parser.add_argument("--tokenizer", default="fallback-v1",
+                        help="'fallback-v1' hashes whole words into vocab_size buckets "
+                             "(~12 English words share each id at vocab 16384), or "
+                             "'hf:gpt2' for a real sub-word tokenizer. Use hf:gpt2 with "
+                             "--vocab-size 50257 to measure language modelling rather "
+                             "than hash-bucket prediction.")
+    parser.add_argument("--jsonl-shards", action="store_true",
+                        help="Use packed JSONL instead of memory-mapped binary shards "
+                             "(slower and far more memory; identical loss curves)")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available()
@@ -217,9 +306,13 @@ def main() -> None:
     shards = build_corpus(Path(args.corpus_dir), target_tokens=target_tokens,
                           vocab_size=args.vocab_size, sequence_length=args.seq_len,
                           seed=17, proxy_vocabulary=args.proxy_vocabulary,
-                          proxy_successors=args.proxy_successors)
+                          proxy_successors=args.proxy_successors,
+                          near_duplicate=args.near_duplicate,
+                          binary_shards=not args.jsonl_shards,
+                          tokenizer_id=args.tokenizer)
     print(f"   train {shards['train']['tokens']:,} tokens | "
-          f"heldout {shards['heldout']['tokens']:,} tokens")
+          f"heldout {shards['heldout']['tokens']:,} tokens "
+          f"| format {shards['format']}")
 
     print("\n== 2. Budget gate (before any GPU time) ==")
     from src.data.budget import check_token_budget
@@ -243,19 +336,61 @@ def main() -> None:
                   batch_size=args.batch_size, sequence_length=args.seq_len,
                   device=device, precision=args.precision,
                   checkpoint_every=args.checkpoint_every, grad_clip=args.grad_clip,
-                  ledger=ledger, run_dir=run_dir)
+                  ledger=ledger, run_dir=run_dir,
+                  keep_checkpoints=args.keep_checkpoints)
+
+    # Arms are run defensively. A single failure -- a genuinely diverged Muon
+    # run, an out-of-memory, a session interruption -- must not throw away the
+    # arms that already finished: their checkpoints and ledger rows are hours of
+    # GPU time, and re-running resumes from them. Whatever completed is written
+    # to disk before the script gives up.
+    def attempt(label, **kwargs):
+        try:
+            return run_arm(label, **kwargs, **common), None
+        except Exception as error:  # noqa: BLE001 - reported, not swallowed
+            print(f"   [FAILED] {label}: {type(error).__name__}: {error}")
+            return None, f"{label}: {type(error).__name__}: {error}"
+
+    failures: list[str] = []
 
     print("\n== 3. Two-seed baseline (AdamW) ==")
-    a0 = run_arm("baseline-s17", seed=17, use_muon=False, levers=[], **common)
-    a1 = run_arm("baseline-s23", seed=23, use_muon=False, levers=[], **common)
-    spread = abs(a0["final"]["val_acc"] - a1["final"]["val_acc"])
-    print(f"   acc {a0['final']['val_acc']:.4f} / {a1['final']['val_acc']:.4f} "
-          f"spread {spread:.4f}")
+    a0, error = attempt("baseline-s17", seed=17, use_muon=False, levers=[])
+    failures += [error] if error else []
+    a1, error = attempt("baseline-s23", seed=23, use_muon=False, levers=[])
+    failures += [error] if error else []
+    if a0 and a1:
+        spread = abs(a0["final"]["val_acc"] - a1["final"]["val_acc"])
+        print(f"   acc {a0['final']['val_acc']:.4f} / {a1['final']['val_acc']:.4f} "
+              f"spread {spread:.4f}")
+    else:
+        spread = float("nan")
 
     print("\n== 4. Muon lever ==")
-    m0 = run_arm("optimizer-s17", seed=17, use_muon=True, levers=["optimizer"], **common)
-    m1 = run_arm("optimizer-s23", seed=23, use_muon=True, levers=["optimizer"], **common)
-    print(f"   acc {m0['final']['val_acc']:.4f} / {m1['final']['val_acc']:.4f}")
+    m0, error = attempt("optimizer-s17", seed=17, use_muon=True, levers=["optimizer"])
+    failures += [error] if error else []
+    m1, error = attempt("optimizer-s23", seed=23, use_muon=True, levers=["optimizer"])
+    failures += [error] if error else []
+    if m0 and m1:
+        print(f"   acc {m0['final']['val_acc']:.4f} / {m1['final']['val_acc']:.4f}")
+
+    partial = {"schema_version": 1, "device": device, "params": n_params,
+               "model": model_config, "sequence_length": args.seq_len,
+               "steps": args.steps, "batch_size": args.batch_size,
+               "precision": args.precision, "grad_clip": args.grad_clip,
+               "corpus": shards, "budget": budget.as_dict(),
+               "baseline_seed_spread_acc": spread,
+               "runs": [r for r in (a0, a1, m0, m1) if r],
+               "failed_arms": failures}
+    _write_evidence(args.out, partial)
+
+    if failures:
+        print("\n" + "=" * 72)
+        print(f"{len(failures)} of 4 arms failed; no comparison is possible.")
+        print("Completed arms are checkpointed and ledgered -- re-running the same")
+        print("command resumes them rather than repeating the work.")
+        for failure in failures:
+            print(f"  - {failure}")
+        raise SystemExit(1)
 
     print("\n== 5. Capability-at-cost ==")
     from src.ledger.compounding import (assert_costs_resolved, compounding_report,
@@ -299,7 +434,10 @@ def main() -> None:
     muon_rows = [r for r in report["rows"] if r["levers"] == ["optimizer"]]
     muon_flops = sum(r["observed_multiplier"] for r in muon_rows) / len(muon_rows)
     muon_wall = sum(r["wall_clock_multiplier"] for r in muon_rows) / len(muon_rows)
-    baseline_band = abs(report["rows"][1]["observed_multiplier"] - 1.0)
+    # Looked up by name, not by position: rows follow input order today, but a
+    # reordering would silently redefine the noise band the verdict rests on.
+    control = next(r for r in report["rows"] if r["name"] == "baseline-s23")
+    baseline_band = abs(control["observed_multiplier"] - 1.0)
 
     print()
     print("=" * 72)
@@ -328,8 +466,7 @@ def main() -> None:
                 "muon_flop_multiplier": muon_flops,
                 "muon_wall_clock_multiplier": muon_wall,
                 "decisive_vs_seed_noise": decisive}
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+    _write_evidence(args.out, evidence)
     print(f"\n  evidence: {args.out}")
 
 

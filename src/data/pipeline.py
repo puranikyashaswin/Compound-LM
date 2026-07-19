@@ -20,6 +20,14 @@ from src.provenance.core import canonical_json, sha256_bytes, sha256_json
 WORD_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
+class _TokenizerCache:
+    """Load a sub-word tokenizer once per process, not once per document."""
+    cache = None
+
+
+_hf_tokenizer = _TokenizerCache()
+
+
 def normalize(text: str) -> str:
     return " ".join(text.replace("\x00", " ").split()).strip()
 
@@ -80,7 +88,23 @@ def prepare_documents(documents: Iterable[str], *, source: str, shard_id: str,
             continue
         seen_exact.add(digest)
         seen_bands.add(bands)
-        if tokenizer_id == "reex-1":
+        if tokenizer_id.startswith("hf:"):
+            # A real sub-word tokenizer. The fallback hashes whole words into
+            # vocab_size buckets, which on English collides ~12 distinct words
+            # into every id at vocab 16384 -- the model then predicts hash
+            # buckets rather than words, and the extra noise can bury a real
+            # optimizer difference inside the seed band.
+            if _hf_tokenizer.cache is None:
+                from src.data.tokenizer import HuggingFaceTokenizer
+                _hf_tokenizer.cache = HuggingFaceTokenizer(tokenizer_id.split(":", 1)[1])
+            ids = _hf_tokenizer.cache.encode(text)
+            if vocab_size is not None and ids and max(ids) >= vocab_size:
+                raise ValueError(
+                    f"tokenizer {tokenizer_id!r} emitted id {max(ids)} for a declared "
+                    f"vocab_size of {vocab_size}; set vocab_size to at least the "
+                    f"tokenizer's own vocabulary size"
+                )
+        elif tokenizer_id == "reex-1":
             from src.data.tokenizer import ReexTokenizer
             tokenizer = ReexTokenizer("work/reex-tokenizer")
             ids = tokenizer.encode(text)
