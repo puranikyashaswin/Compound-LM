@@ -169,7 +169,8 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
           architecture: str = "reference-v1", precision: str = "fp32",
           compile_model: bool = False, grad_clip: float | None = None,
           weight_decay: float = 0.01, eval_batch_size: int = 32,
-          keep_checkpoints: int | None = None) -> dict:
+          keep_checkpoints: int | None = None,
+          init_from: str | None = None) -> dict:
     require_torch()
     import torch
     from src.model.registry import build_model
@@ -245,6 +246,68 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     overflow_steps = 0
     last_finite_grad_norm = 0.0
     spike_streak = 0
+
+    parent_checkpoint_hash = None
+    if init_from:
+        # Warm start, not a resume. Only weights carry over: the optimizer's
+        # moments belong to a different parameter set (after growth some
+        # parameters did not exist), the step counter belongs to a different
+        # run, and the data cursor to a different curve. Reusing any of them
+        # would silently continue a run this one is not a continuation of.
+        if resume:
+            raise ValueError("init_from and resume are mutually exclusive: one starts a "
+                             "new run from borrowed weights, the other continues an "
+                             "existing one")
+        donor = torch.load(init_from, map_location=device, weights_only=False)
+        weights = dict(donor.get("model", donor))
+
+        # Learned position embeddings are sized to the sequence length the donor
+        # trained at. Continuing at a shorter length is fine -- the extra rows
+        # are simply unused, so they are truncated. Continuing at a LONGER one
+        # is not: the added positions were never trained, and the model would
+        # emit noise beyond the donor's context. That is refused rather than
+        # silently padded. (RoPE architectures have no such parameter and skip
+        # this entirely.)
+        position = weights.get("position_embedding.weight")
+        if position is not None:
+            wanted = model.position_embedding.weight.shape[0]
+            have = position.shape[0]
+            if have > wanted:
+                weights["position_embedding.weight"] = position[:wanted].clone()
+                print(f"[init] truncated position embeddings {have} -> {wanted}; "
+                      f"positions beyond {wanted} are unused at this sequence length")
+            elif have < wanted:
+                raise ValueError(
+                    f"donor was trained with {have} positions but this run uses "
+                    f"{wanted}. The extra positions have never been trained, so the "
+                    f"model would produce noise beyond position {have}. Train at "
+                    f"sequence_length <= {have}, or switch to a rotary architecture "
+                    f"(reex-v2), which has no learned position table."
+                )
+
+        # strict=False tolerates absent/extra keys but still raises on a size
+        # mismatch, which is the common case when d_model or vocab differs.
+        # Both are the same user error and both must be refused: loading a
+        # subset would train a half-random model that looks warm-started.
+        try:
+            missing, unexpected = model.load_state_dict(weights, strict=False)
+        except RuntimeError as error:
+            raise ValueError(
+                f"init_from checkpoint does not fit this architecture "
+                f"(d_model={d_model}, n_layers={n_layers}, vocab_size={vocab_size}): "
+                f"{error}. Depth growth changes n_layers only -- width and vocabulary "
+                f"must match the donor."
+            ) from error
+        if missing or unexpected:
+            raise ValueError(
+                f"init_from checkpoint does not fit this architecture: "
+                f"{len(missing)} missing and {len(unexpected)} unexpected tensors "
+                f"(first missing: {missing[:3]}, first unexpected: {unexpected[:3]}). "
+                f"Grow or convert the donor to this shape first."
+            )
+        parent_checkpoint_hash = sha256_bytes(Path(init_from).read_bytes())
+        print(f"[init] warm-started from {Path(init_from).name} "
+              f"(parent {parent_checkpoint_hash[:12]}); optimizer and schedule are fresh")
 
     if resume:
         state = torch.load(resume, map_location=device, weights_only=False)
@@ -358,6 +421,8 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
                    "data_position": data_position,
                    "batch_size": batch_size,
                    "precision": resolved.autocast_dtype,
+                   # Lineage: which checkpoint these weights were grown from.
+                   "parent_checkpoint_hash": parent_checkpoint_hash,
                    "scaler": scaler.state_dict() if scaler.is_enabled() else None}
         _write_checkpoint(payload, target)
         return target
@@ -493,6 +558,7 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
                     "health": report.as_dict(), "resume": resume,
                     "optimizer_groups": optimizer_groups,
                     "overflow_steps": overflow_steps,
+                    "parent_checkpoint_hash": parent_checkpoint_hash,
                 })
 
             # Pruned only after the row is ledgered, so a checkpoint is never
@@ -535,7 +601,8 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
               # Loss-scaling overflows are expected under fp16; a high rate
               # means the scale is mistuned and real steps are being lost.
               "overflow_steps": overflow_steps,
-              "overflow_rate": overflow_steps / max(1, steps - start_step)}
+              "overflow_rate": overflow_steps / max(1, steps - start_step),
+              "parent_checkpoint_hash": parent_checkpoint_hash}
               
     return result
 
