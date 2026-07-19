@@ -33,6 +33,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# Set before torch initialises CUDA: the eager-attention path allocates and frees
+# large per-layer tensors, and without this the freed blocks fragment until a
+# large allocation fails despite enough total free memory.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 REEX1 = "puranikyashaswinsharma/reex-1"
 
 
@@ -178,9 +183,16 @@ def main() -> None:
     parser.add_argument("--donor", default=REEX1)
     parser.add_argument("--donor-subfolder", default="hf_format")
     parser.add_argument("--to-layers", type=int, default=24)
-    parser.add_argument("--total-steps", type=int, default=30000,
-                        help="Steps for the WHOLE job across every session; the LR "
-                             "schedule spans this, so keep it fixed between sessions")
+    parser.add_argument("--target-tokens", type=float, default=1.86e9,
+                        help="Tokens for the WHOLE job. Steps are derived from this, "
+                             "because the loop counts MICRO-batches: with grad-accum 4 a "
+                             "hand-computed step count under-trains by 4x.")
+    parser.add_argument("--total-steps", type=int, default=None,
+                        help="Override the derived step count (rarely needed)")
+    parser.add_argument("--eval-batch-size", type=int, default=4,
+                        help="Held-out eval batch. At seq 1024 with a 50257 head, batch 32 "
+                             "materialises 6.6GB of logits on top of the resident training "
+                             "model and OOMs the T4.")
     parser.add_argument("--max-hours", type=float, default=8.0,
                         help="Stop and upload before the session limit kills the run")
     parser.add_argument("--batch-size", type=int, default=2,
@@ -218,8 +230,15 @@ def main() -> None:
     print("=" * 72)
     print("REEX-1.5 -- resumable multi-session pretraining")
     print("=" * 72)
-    print(f"device {device} | budget {args.max_hours:.1f}h this session "
-          f"| {args.total_steps:,} steps total")
+    tokens_per_step = args.batch_size * args.seq_len
+    total_steps = args.total_steps or int(args.target_tokens / tokens_per_step)
+    args.total_steps = total_steps
+    effective_batch = args.batch_size * args.grad_accum
+    print(f"device {device} | budget {args.max_hours:.1f}h this session")
+    print(f"  micro-batch {args.batch_size} x accum {args.grad_accum} "
+          f"= effective batch {effective_batch}")
+    print(f"  {tokens_per_step:,} tokens/micro-step x {total_steps:,} steps "
+          f"= {total_steps*tokens_per_step/1e9:.2f}B tokens")
 
     from src.train.hf_sync import HubSync
     sync = HubSync(args.hub_repo, min_interval_s=args.sync_interval_min * 60,
@@ -282,12 +301,13 @@ def main() -> None:
         shards["train"]["packed"], str(work / "run"),
         vocab_size=config["vocab_size"], d_model=config["d_model"],
         n_layers=config["n_layers"], n_heads=config["n_heads"],
-        steps=args.total_steps, learning_rate=args.learning_rate, seed=17,
+        steps=total_steps, learning_rate=args.learning_rate, seed=17,
         device=device, checkpoint_every=args.checkpoint_every,
         heldout_shard=shards["heldout"]["packed"], use_muon=args.use_muon,
         batch_size=args.batch_size, lr_schedule=True,
         warmup_fraction=args.warmup_fraction, precision=args.precision,
         grad_clip=args.grad_clip, keep_checkpoints=3, grad_accum=args.grad_accum,
+        eval_batch_size=args.eval_batch_size,
         ledger_path=str(ledger), run_id="reex-1.5",
         levers_on=["growth"] + (["optimizer"] if args.use_muon else []),
         model_override=model,
@@ -296,7 +316,8 @@ def main() -> None:
         on_checkpoint=on_checkpoint)
 
     print("\n== 5. Session summary ==")
-    print(f"   reached step  : {result['reached_step']:,} / {args.total_steps:,}")
+    print(f"   reached step  : {result['reached_step']:,} / {total_steps:,} "
+          f"({result['reached_step']*tokens_per_step/1e9:.3f}B tokens)")
     print(f"   final loss    : {result['final_loss']:.4f}")
     if result.get("eval_scores"):
         print(f"   held-out acc  : {result['eval_scores']['val_acc']:.4f}  "
