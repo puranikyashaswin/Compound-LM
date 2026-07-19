@@ -16,6 +16,7 @@ from typing import Any
 
 from src.data.loader import open_shard
 from src.model.reference import require_torch
+from src.train.reference import assert_token_ids_in_range
 
 
 def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu",
@@ -59,7 +60,8 @@ def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu",
             # shard and weight them twice in the mean.
             take = min(batch_size, len(rows) - index)
             batch_ids, batch_docs = rows.batch(index, take)
-            ids = torch.tensor(batch_ids, dtype=torch.long, device=device) % vocab
+            ids = torch.tensor(batch_ids, dtype=torch.long, device=device)
+            assert_token_ids_in_range(ids, vocab)
             docs = torch.tensor(batch_docs, dtype=torch.long, device=device)
             logits = model(ids, docs)
             # Predict position t+1 from t; only score targets inside a real document.

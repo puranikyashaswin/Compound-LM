@@ -21,7 +21,8 @@ DOCS = [
 
 
 def _shard(tmp_path):
-    prepare_documents(DOCS, source="test", shard_id="s", output_dir=tmp_path)
+    prepare_documents(DOCS, source="test", shard_id="s", output_dir=tmp_path,
+                      vocab_size=4096)
     packed = tmp_path / "packed.jsonl"
     pack_shard(tmp_path / "s.jsonl", packed, sequence_length=48)
     return str(packed)
@@ -31,7 +32,7 @@ def test_train_records_real_eval_scores(tmp_path):
     from src.train.reference import train
 
     shard = _shard(tmp_path)
-    result = train(shard, str(tmp_path / "run"), vocab_size=2048, d_model=32,
+    result = train(shard, str(tmp_path / "run"), vocab_size=4096, d_model=32,
                    n_layers=2, n_heads=4, steps=30, device="cpu",
                    heldout_shard=shard, levers_on=["optimizer"], use_muon=True)
     scores = result["eval_scores"]
@@ -46,7 +47,7 @@ def test_evaluate_is_deterministic(tmp_path):
     from src.train.reference import train
 
     shard = _shard(tmp_path)
-    result = train(shard, str(tmp_path / "run"), vocab_size=2048, d_model=32,
+    result = train(shard, str(tmp_path / "run"), vocab_size=4096, d_model=32,
                    n_layers=2, n_heads=4, steps=10, device="cpu")
     a = evaluate(result["checkpoint"], shard, device="cpu")
     b = evaluate(result["checkpoint"], shard, device="cpu")

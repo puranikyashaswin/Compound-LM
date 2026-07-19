@@ -3,6 +3,7 @@
   "shard_id": "protocol-train",
   "source": "synthetic-protocol",
   "tokenizer_id": "fallback-v1",
+  "vocab_size": 4096,
   "document_count_input": 32,
   "document_count_kept": 32,
   "token_count": 512,
@@ -11,8 +12,8 @@
     "exact_duplicate": 0,
     "near_duplicate": 0
   },
-  "preprocessing_wall_clock_s": 0.0034461250179447234,
+  "preprocessing_wall_clock_s": 0.0033917080145329237,
   "preprocessing_cost_usd": 0.0,
-  "shard_sha256": "bfcc081860c96c3e6d150603daa26554e2c78241842de32e0707662483d4d5c9",
-  "datasheet_hash": "4e98080b64f135dafe642fb4326eef786d2933be4ca6c38379eac1fa401223bd"
+  "shard_sha256": "a22e74660d59937d87ce31fadc9cbda20f1998577866a7c1ff8dac7b4c303025",
+  "datasheet_hash": "88c8bb9e94586471bde991ec6c32408da08c65e15ca215d980b5e8f0cf756a89"
 }

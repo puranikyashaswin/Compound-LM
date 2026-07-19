@@ -16,7 +16,8 @@ from src.train.reference import (REPLAY_TOLERANCE, _measurements_agree,
 
 SHARD = "data/protocol-v1/protocol-train-packed.jsonl"
 HELDOUT = "data/protocol-v1/protocol-heldout-packed.jsonl"
-TINY = dict(vocab_size=512, d_model=32, n_layers=2, n_heads=2)
+# vocab must cover the shard's declared range (protocol shards fold to 4096).
+TINY = dict(vocab_size=4096, d_model=32, n_layers=2, n_heads=2)
 
 
 def _train(tmp_path, **kwargs):

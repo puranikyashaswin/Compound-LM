@@ -19,16 +19,16 @@ Each of these was a green, healthy, fully-ledgered run that measured nothing rea
 - **`1.000×` again, after the init fix.** With a sane init the cycle rule is learned before the first checkpoint, so every cost was an unobserved lower bound and all runs tied by construction. Now gated: `assert_costs_resolved` refuses a comparison built entirely from lower bounds.
 
 <!-- AUTOGEN:TABLE START -->
-| Run | Levers | Cost (FLOPs) | Multiplier | Overlap |
-|---|---|---:|---:|---:|
-| baseline-s17 | baseline | 2.406e+10 | 1.000× | 1.000× |
-| baseline-s23 | baseline | 2.596e+10 | 0.927× | 0.927× |
-| optimizer-s17 | optimizer | 1.323e+10 | 1.819× | 1.021× |
-| optimizer-s23 | optimizer | 1.351e+10 | 1.781× | 1.000× |
-| architecture-s17 | architecture | 4.664e+10 | 0.516× | 1.028× |
-| architecture-s23 | architecture | 4.797e+10 | 0.502× | 1.000× |
-| compound-s17 | architecture, optimizer | 1.658e+10 | 1.451× | 1.624× |
-| compound-s23 | architecture, optimizer | 1.657e+10 | 1.452× | 1.625× |
+| Run | Levers | Cost (FLOPs) | FLOP mult. | Wall-clock mult. | Overlap |
+|---|---|---:|---:|---:|---:|
+| baseline-s17 | baseline | 2.406e+10 | 1.000× | noisy | 1.000× |
+| baseline-s23 | baseline | 2.596e+10 | 0.927× | noisy | 0.927× |
+| optimizer-s17 | optimizer | 1.323e+10 | 1.819× | noisy | 1.021× |
+| optimizer-s23 | optimizer | 1.351e+10 | 1.781× | noisy | 1.000× |
+| architecture-s17 | architecture | 4.664e+10 | 0.516× | noisy | 1.028× |
+| architecture-s23 | architecture | 4.797e+10 | 0.502× | noisy | 1.000× |
+| compound-s17 | architecture, optimizer | 1.658e+10 | 1.451× | noisy | 1.624× |
+| compound-s23 | architecture, optimizer | 1.657e+10 | 1.452× | noisy | 1.625× |
 <!-- AUTOGEN:TABLE END -->
 
 ## Verifying the claims

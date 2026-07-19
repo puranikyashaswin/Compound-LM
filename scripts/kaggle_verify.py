@@ -176,25 +176,61 @@ def main() -> None:
     equivalence_ok = worst_divergence <= 0.05
     print(f"  equivalence (loss tracks fp32): {'PASS' if equivalence_ok else 'FAIL'}")
 
-    # The honest composite for this GPU: precision x the FLOP levers that the
-    # protocol has actually validated. Muon enters as a wall-clock figure.
+    # The headline is the DIRECTLY MEASURED combination, not a product of
+    # separately-measured levers. Two reasons, both learned the hard way:
+    #
+    #   1. The per-lever numbers come from different shapes. The precision
+    #      figure above is measured on its own sweep; the lever figures use the
+    #      lever baseline shape. Multiplying across shapes is not a measurement
+    #      of anything.
+    #   2. Levers overlap. The product overstates the combination whenever they
+    #      compete for the same bottleneck -- which is exactly the quantity this
+    #      repo's compounding table exists to report.
+    combined = levers.get("vocab + depth + amp")
+    same_shape_product = (levers.get("vocab 50257->16384", 1.0)
+                          * levers.get("depth 12->6", 1.0))
+
+    print()
+    print("  MEASURED TOGETHER (one shape, one run) -- the number to trust:")
+    if combined:
+        print(f"    vocab + depth + mixed precision: {combined:.2f}x")
+        # Precision at the lever shape is implied by the combination, not the
+        # standalone sweep, so overlap is computed against what is comparable.
+        print(f"    product of vocab x depth alone:  {same_shape_product:.2f}x")
+        print(f"    => precision contributed a further "
+              f"{combined / same_shape_product:.2f}x on top of them")
+    else:
+        print("    combination did not run")
+
     muon_step_cost = 1.0 / levers.get("Muon step cost", 1.0)
     muon_wall_clock = 1.80 / muon_step_cost if muon_step_cost else 1.80
-    total = best * levers.get("vocab 50257->16384", 1.0) * levers.get("depth 12->6", 1.0)
     print()
-    print(f"  precision {best:.2f}x  x  vocab {levers.get('vocab 50257->16384', 1):.2f}x  "
-          f"x  depth {levers.get('depth 12->6', 1):.2f}x  =  {total:.2f}x")
-    print(f"  Muon step cost measured {muon_step_cost:.2f}x  ->  "
-          f"wall-clock benefit {muon_wall_clock:.2f}x (from a 1.80x FLOP win)")
-    print(f"  COMPOSITE (throughput+shape+optimizer): {total * muon_wall_clock:.2f}x")
+    print(f"  Muon: steps cost {muon_step_cost:.2f}x more here, so a 1.80x FLOP win")
+    print(f"        is {muon_wall_clock:.2f}x in wall clock -- BUT that 1.80x is a")
+    print("        toy-scale (64-word corpus) result. It is the weakest number on")
+    print("        this page and must be re-measured at real scale before use.")
+
+    if combined:
+        print()
+        print(f"  VERIFIED ON THIS GPU: {combined:.2f}x "
+              f"(equivalence-checked, single shape)")
+        print(f"  With Muon, IF its toy multiplier holds: "
+              f"{combined * muon_wall_clock:.2f}x (unverified at scale)")
+
     print()
     if best < 1.5:
-        print("  NOTE: precision gain below 1.5x. The 4x plan assumed ~2x here.")
-        print("  Re-derive the plan with this number rather than the assumption.")
+        print("  NOTE: best precision gain below 1.5x -- re-derive the plan with")
+        print("  this number rather than the 2x assumption.")
+    small = min(measured, key=lambda item: item[2]["speedup"])
+    print(f"  Size sensitivity: precision ranged {small[2]['speedup']:.2f}x to "
+          f"{best:.2f}x across shapes.")
+    print("  Small batches forfeit most of the gain -- size the real run accordingly.")
 
     payload = {"gpu": name, "torch": torch.__version__, "bf16_supported": bf16,
                "resolved": resolved.as_dict(), "precision_by_shape": records,
-               "levers": levers, "composite": total * muon_wall_clock}
+               "levers": levers,
+               "verified_combined": combined,
+               "muon_wall_clock_if_toy_holds": muon_wall_clock}
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(f"  report written: {args.out}")

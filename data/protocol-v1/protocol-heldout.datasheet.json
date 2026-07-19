@@ -3,6 +3,7 @@
   "shard_id": "protocol-heldout",
   "source": "synthetic-protocol",
   "tokenizer_id": "fallback-v1",
+  "vocab_size": 4096,
   "document_count_input": 16,
   "document_count_kept": 16,
   "token_count": 256,
@@ -11,8 +12,8 @@
     "exact_duplicate": 0,
     "near_duplicate": 0
   },
-  "preprocessing_wall_clock_s": 0.0016008749953471124,
+  "preprocessing_wall_clock_s": 0.0017832089797593653,
   "preprocessing_cost_usd": 0.0,
-  "shard_sha256": "5034e9d317d5a63a04d55d955692ec16030d453649328fd071e8ca956f79699f",
-  "datasheet_hash": "8ca8e4ffd151a2ebab0456adb3a3c5edc3dc762c9e9299ec90952dd48dae24d9"
+  "shard_sha256": "d4efe87ea3d0c6c2ee7ed4ab7936e4c58bf8c53281a361cbe825e6bf50ff546c",
+  "datasheet_hash": "714d3aee244044efc63c6546472a426abdec01d0000e18a183c663f142936e8e"
 }

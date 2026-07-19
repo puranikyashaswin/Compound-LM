@@ -24,9 +24,23 @@ def normalize(text: str) -> str:
     return " ".join(text.replace("\x00", " ").split()).strip()
 
 
-def token_ids(text: str) -> list[int]:
-    """Stable tokenizer fallback; real runs inject the frozen Reex tokenizer."""
-    return [int(hashlib.sha256(piece.encode("utf-8")).hexdigest()[:8], 16) for piece in WORD_RE.findall(text)]
+def token_ids(text: str, vocab_size: int | None = None) -> list[int]:
+    """Stable tokenizer fallback; real runs inject the frozen Reex tokenizer.
+
+    The raw form emits 32-bit hashes. ``vocab_size`` folds them into range
+    *here*, at preparation time, where the fold is recorded in the datasheet.
+    It used to happen implicitly in the training loop as ``ids % vocab_size``,
+    which silently remapped any out-of-range token -- including real tokenized
+    corpora loaded against a smaller vocabulary. That turned a configuration
+    error into corrupted data with a plausible-looking loss curve.
+    """
+    raw = [int(hashlib.sha256(piece.encode("utf-8")).hexdigest()[:8], 16)
+           for piece in WORD_RE.findall(text)]
+    if vocab_size is None:
+        return raw
+    if vocab_size < 1:
+        raise ValueError("vocab_size must be positive")
+    return [value % vocab_size for value in raw]
 
 
 def _fingerprint(text: str, bands: int = 8) -> tuple[int, ...]:
@@ -45,7 +59,7 @@ def _fingerprint(text: str, bands: int = 8) -> tuple[int, ...]:
 
 def prepare_documents(documents: Iterable[str], *, source: str, shard_id: str,
                       output_dir: str | Path, tokenizer_id: str = "fallback-v1",
-                      near_duplicate: bool = True) -> dict:
+                      near_duplicate: bool = True, vocab_size: int | None = None) -> dict:
     started = time.perf_counter()
     seen_exact: set[str] = set()
     seen_bands: set[tuple[int, ...]] = set()
@@ -70,8 +84,15 @@ def prepare_documents(documents: Iterable[str], *, source: str, shard_id: str,
             from src.data.tokenizer import ReexTokenizer
             tokenizer = ReexTokenizer("work/reex-tokenizer")
             ids = tokenizer.encode(text)
+            if vocab_size is not None and ids and max(ids) >= vocab_size:
+                raise ValueError(
+                    f"tokenizer {tokenizer_id!r} emitted id {max(ids)} for a declared "
+                    f"vocab_size of {vocab_size}. Folding a real tokenizer's ids into a "
+                    f"smaller vocabulary silently maps distinct tokens onto each other; "
+                    f"retrain the tokenizer at the target size instead."
+                )
         else:
-            ids = token_ids(text)
+            ids = token_ids(text, vocab_size)
         kept.append({"document_id": f"{shard_id}-{index:08d}", "text": text, "text_sha256": digest, "tokens": ids})
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -84,6 +105,9 @@ def prepare_documents(documents: Iterable[str], *, source: str, shard_id: str,
         "shard_id": shard_id,
         "source": source,
         "tokenizer_id": tokenizer_id,
+        # Recorded so a shard states the vocabulary its ids are valid for; the
+        # trainer refuses a model whose vocab_size disagrees.
+        "vocab_size": vocab_size,
         "document_count_input": index + 1 if 'index' in locals() else 0,
         "document_count_kept": len(kept),
         "token_count": sum(len(row["tokens"]) for row in kept),

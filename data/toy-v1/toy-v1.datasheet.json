@@ -1,8 +1,9 @@
 {
   "schema_version": 1,
   "shard_id": "toy-v1",
-  "source": "synthetic-toy",
+  "source": "toy",
   "tokenizer_id": "fallback-v1",
+  "vocab_size": 32768,
   "document_count_input": 32,
   "document_count_kept": 8,
   "token_count": 90,
@@ -11,8 +12,8 @@
     "exact_duplicate": 24,
     "near_duplicate": 0
   },
-  "preprocessing_wall_clock_s": 0.0008117910001601558,
+  "preprocessing_wall_clock_s": 0.0010987089481204748,
   "preprocessing_cost_usd": 0.0,
-  "shard_sha256": "cb36b4c3d624b7fb7070d2ea8f0971451131092541be71f11b89e498ed38aa12",
-  "datasheet_hash": "f95955d0339e50a960dbb83bc11c3bb4dd78b612c6bc6e5f52b985f34a364435"
+  "shard_sha256": "5ba1129e42aff9d64341380bd30b29d10daa0487e2f2405f94a620cddec1e9a9",
+  "datasheet_hash": "51a41d70e01c4c79718eecf1e4608c6d63bc209b8266b477421d5d9faca41afc"
 }

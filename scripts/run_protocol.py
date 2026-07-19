@@ -64,8 +64,11 @@ def build_shards():
     train_docs = TRAIN_DOCUMENTS
     shards = {}
     for name, subset in (("train", train_docs), ("heldout", heldout_docs)):
+        # The fold into vocabulary range happens here, once, and is recorded in
+        # the datasheet -- not implicitly inside the training loop.
         sheet = prepare_documents(subset, source="synthetic-protocol", shard_id=f"protocol-{name}",
-                                  output_dir=out, tokenizer_id="fallback-v1")
+                                  output_dir=out, tokenizer_id="fallback-v1",
+                                  vocab_size=MODEL["vocab_size"])
         packed = out / f"protocol-{name}-packed.jsonl"
         pack_shard(out / f"protocol-{name}.jsonl", packed, sequence_length=SEQ_LEN)
         shards[name] = {"packed": str(packed), "tokens": sheet["token_count"]}
@@ -78,11 +81,19 @@ def run_one(name, shard, heldout, *, seed, use_muon, levers, params,
     from src.eval.intrinsic import evaluate
     from src.train.reference import train
 
+    import time
+
     out_dir = ROOT / "runs" / name
+    started = time.perf_counter()
     result = train(shard, str(out_dir), **MODEL, steps=STEPS, seed=seed, device="cpu",
                    checkpoint_every=CHECKPOINT_EVERY, heldout_shard=heldout,
                    use_muon=use_muon, levers_on=levers, batch_size=BATCH_SIZE,
                    architecture=architecture)
+    # Wall clock is recorded alongside FLOPs because they disagree: the 6*N*tokens
+    # cost model prices the model's arithmetic and is blind to optimizer overhead,
+    # so Muon's FLOP multiplier flatters its real saving.
+    wall_clock = time.perf_counter() - started
+    seconds_per_step = wall_clock / STEPS
     # Real capability-at-cost curve: cost = 6·N·tokens = 6·N·(SEQ_LEN·batch·step) FLOPs.
     curve = []
     for ckpt in sorted(out_dir.glob("checkpoint-*.pt")):
@@ -92,7 +103,8 @@ def run_one(name, shard, heldout, *, seed, use_muon, levers, params,
                       "score": scores["val_acc"], "val_nll": scores["val_nll"]})
     return {"name": name, "seed": seed, "levers": levers, "use_muon": use_muon,
             "final": result["eval_scores"], "health": result["health"],
-            "checkpoint_hash": result["checkpoint_hash"], "curve": curve}
+            "checkpoint_hash": result["checkpoint_hash"], "curve": curve,
+            "wall_clock_s": wall_clock, "seconds_per_step": seconds_per_step}
 
 
 def write_summary(evidence: dict) -> None:
@@ -116,14 +128,21 @@ def write_summary(evidence: dict) -> None:
         f"Target held-out accuracy: {evidence['compounding'].get('target_score')}",
         "",
     ]
-    table = ["| Run | Levers | Cost (FLOPs) | Multiplier | Overlap |",
-             "|---|---|---:|---:|---:|"]
+    table = ["| Run | Levers | Cost (FLOPs) | FLOP mult. | Wall-clock mult. | Overlap |",
+             "|---|---|---:|---:|---:|---:|"]
     for row in evidence["compounding"].get("rows", []):
         levers = ", ".join(row["levers"]) or "baseline"
         overlap = row["overlap_coefficient"]
         overlap_str = f"{overlap:.3f}×" if isinstance(overlap, (int, float)) else "n/a"
+        wall = row.get("wall_clock_multiplier")
+        # Suppressed rather than published when the timing control says the
+        # machine is too noisy to distinguish a lever from scheduler jitter.
+        if not evidence["compounding"].get("timing_trustworthy", False):
+            wall_str = "noisy"
+        else:
+            wall_str = f"{wall:.3f}×" if isinstance(wall, (int, float)) else "n/a"
         table.append(f"| {row['name']} | {levers} | {row['recipe_cost']:.3e} | "
-                     f"{row['observed_multiplier']:.3f}× | {overlap_str} |")
+                     f"{row['observed_multiplier']:.3f}× | {wall_str} | {overlap_str} |")
     table_block = "\n".join(table)
     lines += [table_block, "", f"_{evidence['note']}_", ""]
     (ROOT / "outputs" / "protocol-summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -215,10 +234,35 @@ def main():
     report = {"target_score": target}
     if len(reachable) == len(comp_rows):
         report = compounding_report(comp_rows, target_score=target)
+        # Translate each FLOP multiplier into wall clock using the measured
+        # seconds-per-step ratio. A lever whose steps cost more (Muon) wins less
+        # real time than its FLOP figure claims, and the ledger cannot see that.
+        from src.ledger.cost_model import wall_clock_multiplier
+        by_name = {r["name"]: r for r in runs}
+        baseline_sps = by_name["baseline-s17"]["seconds_per_step"]
+
+        # Timing-noise control. The two baseline seeds run identical configs, so
+        # any difference in their seconds-per-step is measurement noise, not a
+        # lever. If that noise is large, every wall-clock multiplier below is
+        # unreliable -- which is exactly what a shared, throttling CPU produces.
+        # Reported rather than silently published as if it were signal.
+        control_ratio = by_name["baseline-s23"]["seconds_per_step"] / baseline_sps
+        timing_noise = abs(control_ratio - 1.0)
+        report["timing_noise"] = timing_noise
+        report["timing_trustworthy"] = timing_noise <= 0.05
+        if timing_noise > 0.05:
+            print(f"   [warn] timing noise {timing_noise:.1%} between identical baseline "
+                  f"seeds: wall-clock multipliers below are NOT reliable on this machine. "
+                  f"FLOP multipliers are unaffected.")
+
         for row in report["rows"]:
-            print(f"   {row['name']:<14} cost={row['recipe_cost']:.3e} "
-                  f"multiplier={row['observed_multiplier']:.3f}× "
-                  f"overlap={row['overlap_coefficient']}")
+            ratio = by_name[row["name"]]["seconds_per_step"] / baseline_sps
+            row["step_cost_ratio"] = ratio
+            row["wall_clock_multiplier"] = wall_clock_multiplier(
+                flop_multiplier=row["observed_multiplier"], step_cost_ratio=ratio)
+            print(f"   {row['name']:<18} flops={row['observed_multiplier']:.3f}× "
+                  f"step_cost={ratio:.2f}× wall_clock={row['wall_clock_multiplier']:.3f}× "
+                  f"overlap={row['overlap_coefficient']:.3f}")
     else:
         print(f"   target {target} not reached by all runs; reporting raw curves only")
 

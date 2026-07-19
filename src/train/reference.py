@@ -15,6 +15,28 @@ from src.model.reference import require_torch
 from src.provenance.core import config_hash, sha256_bytes
 
 
+def assert_token_ids_in_range(ids, vocab_size: int) -> None:
+    """Refuse tokens the model has no embedding for.
+
+    This used to be ``ids % vocab_size``. Folding is fine for the hash-based
+    fallback tokenizer, but applying it to a real corpus silently remaps every
+    out-of-range token onto a *different valid token*: training proceeds, the
+    loss curve looks healthy, and the run measures nothing. It is precisely the
+    failure mode of the vocabulary-reduction lever, where a 50257-vocab corpus
+    meets a 16384-vocab model. The fold now happens once, explicitly, at data
+    preparation time (``src/data/pipeline.token_ids``) and is recorded in the
+    datasheet; here a mismatch is an error.
+    """
+    highest = int(ids.max())
+    lowest = int(ids.min())
+    if highest >= vocab_size or lowest < 0:
+        raise ValueError(
+            f"token id out of range: shard contains ids in [{lowest}, {highest}] but the "
+            f"model's vocab_size is {vocab_size}. The shard was tokenized for a different "
+            f"vocabulary -- rebuild it at this size rather than folding ids into range."
+        )
+
+
 def masked_next_token_loss(logits, ids, document_ids):
     import torch
     # Standard next-token prediction alignment:
@@ -319,7 +341,8 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         batch_ids, batch_docs = rows.batch(data_position, batch_size)
         data_position = (data_position + batch_size) % len(rows)
 
-        ids = torch.tensor(batch_ids, dtype=torch.long, device=device) % vocab_size
+        ids = torch.tensor(batch_ids, dtype=torch.long, device=device)
+        assert_token_ids_in_range(ids, vocab_size)
         docs = torch.tensor(batch_docs, dtype=torch.long, device=device)
 
         if lr_schedule:

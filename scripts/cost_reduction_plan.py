@@ -96,12 +96,12 @@ def main() -> None:
 
     levers = [
         ("THROUGHPUT (seconds/step; FLOPs unchanged)", [
-            ("mixed precision (bf16/fp16 autocast)", 2.0, LITERATURE,
-             "CUDA tensor cores. MEASURED on Apple M2/MPS: 1.15x at batch 8 x "
-             "seq 512, and 0.89x -- a REGRESSION -- at batch 2 x seq 256, where "
-             "the tensors are too small to pay for autocast overhead. bf16 on "
-             "MPS measured 0.97x. This lever is hardware-specific: verify it on "
-             "the GPU you will actually rent before planning around 2x"),
+            ("mixed precision (fp16 autocast)", 3.52, MEASURED,
+             "MEASURED on a Tesla T4: 3.52x at batch 16 x seq 512, but only "
+             "1.26x at batch 2 x seq 256 -- strongly size-dependent, so size the "
+             "real run large. On Apple M2/MPS the same lever measured 1.15x and "
+             "0.89x. Selecting bf16 on the T4 measured 0.73x, SLOWER than fp32, "
+             "because torch reports emulated bf16 as supported on Turing"),
             ("fused AdamW + TF32", 1.10, ARITHMETIC,
              "optimizer step is a real fraction of step time at 22M params"),
             (f"width rebalance d_model {args.d_model}x{args.n_layers} -> "

@@ -1,5 +1,65 @@
 # Cutting training cost
 
+## Bugs this audit found in its own code
+
+Three, all of which would have produced confident wrong numbers:
+
+1. **Silent token remapping.** The trainer did `ids % vocab_size`. Correct for
+   the hash-based fallback tokenizer (whose ids are 32-bit hashes), but it was
+   applied to *every* shard — so loading a 50257-vocab corpus against a
+   16384-vocab model mapped token 20000 onto token 3616, a different valid
+   token. Training ran, loss looked healthy, the run measured nothing. **That
+   is precisely the configuration the vocabulary-reduction lever creates.** The
+   fold now happens once at data preparation, is recorded in the datasheet, and
+   a mismatch at train time is an error (`assert_token_ids_in_range`).
+   Regression-tested in `tests/test_token_range.py`.
+
+2. **`torch.cuda.is_bf16_supported()` lies on Turing** — it counts emulated
+   bf16, so a T4 selects a path measured at 0.73–0.77×, slower than fp32.
+   Now resolved from compute capability.
+
+3. **Wall-clock multipliers published as science when they were jitter.** The
+   two baseline seeds run identical configs, so any gap in their
+   seconds-per-step is pure noise. On this CPU it was 5.6–15%, larger than
+   several levers. The protocol now uses that pair as a timing control and
+   prints `noisy` instead of a number when it fails.
+
+## Verified on a Tesla T4 (Kaggle, free tier)
+
+**6.58× measured, equivalence-checked**, for vocabulary + depth + mixed
+precision together on one shape in one run. Loss curves tracked fp32 to
+2.4e-04, far inside the 0.05 tolerance, so the speedup is real and not bought
+with accuracy.
+
+| Lever | T4 measured | Predicted | Note |
+|---|---:|---:|---|
+| mixed precision (fp16) | **3.52×** | 2.00× | beat the projection at large shapes |
+| vocabulary 50257→16384 | **1.50×** | 1.49× | arithmetic essentially exact |
+| depth 12→6 | **1.35×** | 1.23× | |
+| Muon step cost | **1.07×** | — | far cheaper than the M2's 1.39× |
+| **all three, measured together** | **6.58×** | — | the number to trust |
+
+Two things this run taught that no amount of arithmetic would have:
+
+- **`torch.cuda.is_bf16_supported()` lies on Turing.** It counts *emulated*
+  bf16, so a T4 reports `True` while having no bf16 tensor cores. Selecting it
+  measured **0.73–0.77×** — slower than fp32. `resolve_precision` now reads
+  compute capability directly (native bf16 from SM 8.0). Pinned by
+  `tests/test_systems_precision.py::test_turing_does_not_get_emulated_bf16`.
+- **The precision gain is strongly size-dependent:** 1.26× at batch 2 × seq 256,
+  but 3.52× at batch 16 × seq 512. A small-batch run forfeits most of it.
+
+**Levers overlap.** vocab × depth alone multiply to 2.03×; measured together
+with precision the total is 6.58×, against a naive product of 7.13×. That is
+an overlap coefficient of ~0.92 — real, and exactly what this repo's
+compounding table exists to surface. Never report a product where a direct
+measurement is available.
+
+**Still unverified: Muon's 1.80×**, which is a toy-scale result on a 64-word
+corpus. Its step cost is now measured (1.07× on T4, so ~1.68× wall clock *if*
+the toy multiplier holds), but the multiplier itself must be re-measured at
+real scale before anyone plans around it.
+
 > **Corrections after measuring on real hardware.** An earlier version of this
 > document claimed 6.35× from "verified" levers. Measuring on an Apple M2 GPU
 > (`scripts/verify_levers.py`) showed two of those numbers were wrong:
