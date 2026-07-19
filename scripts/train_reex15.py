@@ -37,7 +37,8 @@ REEX1 = "puranikyashaswinsharma/reex-1"
 
 
 def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
-                 sequence_length: int, vocab_size: int, heldout_documents: int = 2000) -> dict:
+                 sequence_length: int, vocab_size: int, heldout_documents: int = 2000,
+                 sync=None) -> dict:
     """Stream fresh FineWeb-Edu straight into memory-mapped shards.
 
     Deliberately never materialises the corpus. `prepare_documents` keeps every
@@ -66,51 +67,79 @@ def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
         print("   reusing corpus already built in this session")
         return json.loads(marker.read_text())
 
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    counts = {"train": 0, "heldout": 0, "documents": 0, "skipped": 0}
+    # Kaggle wipes the working directory between sessions, so without this the
+    # identical corpus is rebuilt every time -- ~35 minutes each, four times.
+    # Downloading the shards back costs a couple of minutes instead.
+    if sync is not None and sync.pull_corpus(out_dir):
+        if marker.exists():
+            print("   corpus restored from the Hub (skipped rebuild)")
+            return json.loads(marker.read_text())
 
-    def documents(which: str):
-        """Yield {document_id, tokens} for one split, tokenising as we go."""
-        stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
-                              split="train", streaming=True)
-        seen = kept = 0
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    counts = {"train": 0, "heldout": 0}
+
+    # ONE pass over the stream, not one per split. Opening a fresh stream per
+    # split re-pays the 2.4M-document skip -- about five minutes, every session.
+    # The iterator is held across both writes so the skip happens once.
+    stream = iter(load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
+                               split="train", streaming=True))
+    seen = 0
+    for record in stream:
+        seen += 1
+        if seen % 500_000 == 0:
+            print(f"     skipping documents Reex-1 saw: {seen:,}/{skip_documents:,}")
+        if seen >= skip_documents:
+            break
+
+    def tokenize(text: str, which: str, index: int) -> dict | None:
+        ids = [i for i in tokenizer.encode(text) if i < vocab_size]
+        if not ids:
+            return None
+        counts[which] += len(ids)
+        if counts[which] % 25_000_000 < len(ids):
+            print(f"     {which}: {counts[which]/1e6:.0f}M tokens")
+        return {"document_id": f"fwe-{which}-{index:08d}", "tokens": ids}
+
+    # Held-out first, buffered: it is only ~2000 documents, and materialising it
+    # lets the same iterator continue straight into the training split.
+    heldout: list[dict] = []
+    index = 0
+    for record in stream:
+        text = record["text"].strip()
+        if not text:
+            continue
+        index += 1
+        document = tokenize(text, "heldout", index)
+        if document:
+            heldout.append(document)
+        if len(heldout) >= heldout_documents:
+            break
+
+    def train_documents():
+        nonlocal index
         for record in stream:
-            seen += 1
-            if seen <= skip_documents:
-                if seen % 500_000 == 0:
-                    print(f"     skipping documents Reex-1 saw: {seen:,}/{skip_documents:,}")
-                continue
             text = record["text"].strip()
             if not text:
                 continue
-            kept += 1
-            is_heldout = kept <= heldout_documents
-            if (which == "heldout") != is_heldout:
-                if which == "heldout" and kept > heldout_documents:
-                    return
-                continue
-            ids = tokenizer.encode(text)
-            ids = [i for i in ids if i < vocab_size]
-            if not ids:
-                continue
-            counts[which] += len(ids)
-            counts["documents"] += 1
-            if counts[which] % 25_000_000 < len(ids):
-                print(f"     {which}: {counts[which]/1e6:.0f}M tokens")
-            yield {"document_id": f"fwe-{which}-{kept:08d}", "tokens": ids}
-            if which == "train" and counts["train"] >= target_tokens:
+            index += 1
+            document = tokenize(text, "train", index)
+            if document:
+                yield document
+            if counts["train"] >= target_tokens:
                 return
 
     shards = {}
-    for which in ("heldout", "train"):
+    for which, source in (("heldout", heldout), ("train", train_documents())):
         prefix = out_dir / f"reex15-{which}-bin"
-        write_packed_shard(documents(which), prefix, sequence_length=sequence_length,
+        write_packed_shard(source, prefix, sequence_length=sequence_length,
                            vocab_size=vocab_size, tokenizer_id="hf:gpt2",
                            source="fineweb-edu")
         shards[which] = {"packed": str(prefix), "tokens": counts[which]}
         print(f"   {which}: {counts[which]:,} tokens -> {prefix.name}")
 
     marker.write_text(json.dumps(shards, indent=2))
+    if sync is not None:
+        sync.push_corpus(out_dir)
     return shards
 
 
@@ -158,7 +187,10 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1.5e-4)
     parser.add_argument("--warmup-fraction", type=float, default=0.01)
-    parser.add_argument("--checkpoint-every", type=int, default=500)
+    parser.add_argument("--checkpoint-every", type=int, default=2000,
+                        help="Each checkpoint also evaluates the held-out set, "
+                             "which at 500 was 18.5%% overhead (4.6h of a 25h job). "
+                             "2000 costs 4.6%% and risks 13 minutes on a crash.")
     parser.add_argument("--milestone-every", type=int, default=5000)
     parser.add_argument("--sync-interval-min", type=float, default=25.0)
     parser.add_argument("--corpus-tokens", type=int, default=60_000_000)
@@ -221,7 +253,7 @@ def main() -> None:
     shards = build_corpus(work / "corpus", target_tokens=args.corpus_tokens,
                           skip_documents=args.skip_documents,
                           sequence_length=args.seq_len,
-                          vocab_size=config["vocab_size"])
+                          vocab_size=config["vocab_size"], sync=sync)
     print(f"   train {shards['train']['tokens']:,} | "
           f"heldout {shards['heldout']['tokens']:,} tokens")
 

@@ -176,3 +176,41 @@ class HubSync:
             self.status.failures += 1
             self.status.last_error = f"{type(error).__name__}: {error}"
             return False
+
+    # -- corpus cache --------------------------------------------------
+
+    def push_corpus(self, corpus_dir: str | Path) -> bool:
+        """Store the built shards so later sessions download instead of rebuild.
+
+        A Kaggle session wipes its working directory, so an uncached corpus is
+        re-derived from scratch every run -- for Reex-1.5 that is ~35 minutes of
+        streaming, skipping and tokenising, repeated every session for a
+        byte-identical result. Uploading the shards once turns that into a
+        download.
+        """
+        if not self.enabled:
+            return False
+        try:
+            _api(self.token).upload_folder(
+                folder_path=str(corpus_dir), repo_id=self.repo_id, repo_type="model",
+                path_in_repo="corpus", commit_message="corpus shards")
+            print("[hub] corpus cached for later sessions")
+            return True
+        except Exception as error:  # noqa: BLE001
+            self.status.failures += 1
+            self.status.last_error = f"{type(error).__name__}: {error}"
+            print(f"[hub] corpus upload FAILED ({error}); later sessions will rebuild")
+            return False
+
+    def pull_corpus(self, corpus_dir: str | Path) -> bool:
+        """Restore cached shards, or return False if none are stored yet."""
+        if not self.enabled:
+            return False
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download(self.repo_id, repo_type="model", allow_patterns="corpus/*",
+                              local_dir=str(Path(corpus_dir).parent), token=self.token)
+            return (Path(corpus_dir) / "corpus.json").exists()
+        except Exception as error:  # noqa: BLE001
+            print(f"[hub] no cached corpus ({type(error).__name__}); building it")
+            return False
