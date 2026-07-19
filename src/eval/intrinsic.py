@@ -18,16 +18,27 @@ from src.data.loader import open_shard
 from src.model.reference import require_torch
 
 
-def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu") -> dict[str, Any]:
-    """Return intrinsic scores; higher ``val_acc`` is better."""
+def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu",
+             batch_size: int = 32) -> dict[str, Any]:
+    """Return intrinsic scores; higher ``val_acc`` is better.
+
+    Held-out sequences are independent and the document mask is per-sequence,
+    so batching changes throughput and nothing else -- ``batch_size`` must not
+    move any reported score (``tests/test_eval_batching.py`` pins that). It
+    defaults to 32 because this ran one sequence at a time, which leaves a GPU
+    almost entirely idle and made the scheduled evaluation a real fraction of
+    a run's wall clock.
+    """
     require_torch()
     import torch
-    from src.model.reference import ReferenceLM
+    from src.model.registry import model_from_config
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
 
     state = torch.load(checkpoint, map_location=device, weights_only=False)
     config = state["config"]
-    model = ReferenceLM(config["vocab_size"], config["d_model"], config["n_layers"],
-                        config["n_heads"], config["max_seq_len"])
+    model = model_from_config(config)
     model.load_state_dict(state["model"])
     model.to(device).eval()
     vocab = config["vocab_size"]
@@ -42,8 +53,12 @@ def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu") -> dic
     total_correct = 0
     total_tokens = 0
     with torch.no_grad():
-        for index in range(len(rows)):
-            batch_ids, batch_docs = rows.batch(index, 1)
+        for index in range(0, len(rows), batch_size):
+            # Never wrap past the end: rows.batch is cyclic, so a final partial
+            # batch would silently re-score sequences from the start of the
+            # shard and weight them twice in the mean.
+            take = min(batch_size, len(rows) - index)
+            batch_ids, batch_docs = rows.batch(index, take)
             ids = torch.tensor(batch_ids, dtype=torch.long, device=device) % vocab
             docs = torch.tensor(batch_docs, dtype=torch.long, device=device)
             logits = model(ids, docs)

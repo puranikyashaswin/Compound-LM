@@ -4,9 +4,9 @@ An auditable experiment harness for measuring how language-model training effici
 
 The first implementation is the evidence spine: canonical configuration, provenance, append-only ledger, checkpoint health checks, deterministic smoke trainer, and automatic multiplier tables. Expensive model/data adapters are added only after these contracts pass.
 
-`scripts/run_protocol.py` runs the protocol end-to-end at toy scale on CPU: a two-seed baseline plus a Muon optimizer lever, scored by held-out capability and compared by capability-at-cost. The same protocol scales to the 200M baseline by swapping the corpus, config, and (on GPU) the E-v1 benchmark harness.
+`scripts/run_protocol.py` runs the protocol end-to-end at toy scale on CPU: a two-seed baseline plus two levers — the Muon optimizer and the Reex-v2 architecture (RoPE + RMSNorm + SwiGLU, selected via `src/model/registry.py`, parameter-matched to the reference model within 2%) — each in isolation and then compounded, scored by held-out capability and compared by capability-at-cost with an overlap coefficient. The same protocol scales to the 200M baseline by swapping the corpus, config, and (on GPU) the E-v1 benchmark harness.
 
-The toy corpus is 64 words arranged in a fixed cycle, so each word deterministically predicts its successor. Held-out documents are windows the model never trained on (the contamination gate passes honestly), but every word transition inside them appears in training — so held-out accuracy measures learned generalization of the successor rule, not memorization. On that signal, two seeds of the Muon optimizer lever reach the common held-out target at **1.67× and 1.74× less compute** than the AdamW baseline (mean **1.71×**), against a baseline seed noise band of **0.12×**. Reruns reproduce every multiplier and checkpoint hash bit-identically.
+The toy corpus is 64 words arranged in a fixed cycle, so each word deterministically predicts its successor. Held-out documents are windows the model never trained on (the contamination gate passes honestly), but every word transition inside them appears in training — so held-out accuracy measures learned generalization of the successor rule, not memorization. On that signal, at this scale: the Muon optimizer lever reaches the common held-out target at **~1.8× less compute** than the AdamW baseline (seed noise band 0.07×); the Reex-v2 architecture lever alone is **slower** (~0.51×) on this corpus; and the compound arm (Reex-v2 + Muon) lands at **~1.45×** — an overlap coefficient of ~1.62, meaning Muon recovers far more of the architecture's toy-scale deficit than the independent product predicts. Per the build plan, an overlap above 1 triggers an audit before it is celebrated, and a toy-scale architecture result carries no weight for 200M either way — the cycle corpus rewards the reference model's learned absolute positions, which is exactly the kind of proxy artifact the re-measure-at-scale rule exists for.
 
 Toy scale is a proxy, not a prediction: these multipliers are re-measured at each real scale before they are trusted.
 
@@ -21,11 +21,32 @@ Each of these was a green, healthy, fully-ledgered run that measured nothing rea
 <!-- AUTOGEN:TABLE START -->
 | Run | Levers | Cost (FLOPs) | Multiplier | Overlap |
 |---|---|---:|---:|---:|
-| baseline-s17 | baseline | 2.537e+10 | 1.000× | 1.000× |
-| baseline-s23 | baseline | 2.878e+10 | 0.881× | 0.881× |
-| optimizer-s17 | optimizer | 1.521e+10 | 1.667× | 0.957× |
-| optimizer-s23 | optimizer | 1.456e+10 | 1.743× | 1.000× |
+| baseline-s17 | baseline | 2.406e+10 | 1.000× | 1.000× |
+| baseline-s23 | baseline | 2.596e+10 | 0.927× | 0.927× |
+| optimizer-s17 | optimizer | 1.323e+10 | 1.819× | 1.021× |
+| optimizer-s23 | optimizer | 1.351e+10 | 1.781× | 1.000× |
+| architecture-s17 | architecture | 4.664e+10 | 0.516× | 1.028× |
+| architecture-s23 | architecture | 4.797e+10 | 0.502× | 1.000× |
+| compound-s17 | architecture, optimizer | 1.658e+10 | 1.451× | 1.624× |
+| compound-s23 | architecture, optimizer | 1.657e+10 | 1.452× | 1.625× |
 <!-- AUTOGEN:TABLE END -->
+
+## Verifying the claims
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/verify_all.py     # everything, labelled
+PYTHONPATH=. .venv/bin/python scripts/verify_speedup.py # precision, on a GPU
+PYTHONPATH=. .venv/bin/python scripts/verify_levers.py  # per-lever wall-clock
+```
+
+`verify_all.py` sorts every claim into **VERIFIED** (executed here),
+**PORTABLE** (measured on a real accelerator), and **PROJECTED** (arithmetic
+only), and never reports the third with the confidence of the first. That
+distinction is load-bearing: measuring on an M2 GPU showed the projected 2×
+mixed-precision speedup was 1.15× at one tensor size and *0.89× — a
+regression* at another, and that Muon's 1.82× FLOP win is 1.31× in wall clock
+once its costlier steps are counted. See
+[docs/cost-reduction-plan.md](docs/cost-reduction-plan.md).
 
 ## Quick start
 

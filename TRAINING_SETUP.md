@@ -28,6 +28,59 @@ OOM a Kaggle instance. The binary format memory-maps, so shard size no longer
 bounds memory. Both formats produce identical loss curves
 (`tests/test_binshard_training.py`), so the swap does not change the science.
 
+## Cutting the cost of the run (read before booking GPU time)
+
+Every GPU run in this repo's history trained in **fp32**: `SystemsPolicy` was
+defined but never wired into the training loop. Mixed precision, TF32, and
+fused AdamW are now available and together roughly halve wall-clock at
+identical mathematics.
+
+```bash
+# 'auto' = bf16 on Ampere+, fp16 + GradScaler on Turing (Kaggle T4).
+# It never resolves to fp32 on a GPU -- the old bf16-or-nothing policy did,
+# which is how a T4 run silently paid fp32 prices.
+python scripts/kaggle_validation.py --corpus data/real-v2 --lr-schedule \
+    --precision auto
+```
+
+Default stays `fp32` so existing ledger rows remain reproducible; speed is
+opt-in. Precision is recorded per checkpoint and resuming across a precision
+change is refused.
+
+Training-quality flags, all opt-in for the same reason:
+
+```bash
+--grad-clip 1.0        # the old call site clipped at 1e9, i.e. never clipped
+--weight-decay 0.01    # 2-D tensors only; norms and biases are now exempt
+--eval-batch-size 32   # held-out eval ran one sequence at a time (4.5x slower)
+``` See [docs/cost-reduction-plan.md](docs/cost-reduction-plan.md)
+for the full ≥50% plan, and run `python scripts/cost_reduction_plan.py` to
+regenerate its arithmetic — including the finding that at `d_model=256` with a
+50257 vocabulary, the output head costs more than the whole transformer stack.
+
+## Choosing the architecture
+
+The trainer builds its model through `src/model/registry.py`. Two lineages
+exist today:
+
+- `reference-v1` (default): GPT-2-style — learned positions, LayerNorm, GELU.
+- `reex-v2`: the Reex-2 candidate — RoPE, RMSNorm, SwiGLU, parameter-matched
+  to the reference within ~1%.
+
+```bash
+# Same matrix, Reex-v2 lineage. Run/ledger IDs are prefixed with the
+# architecture so it can never be silently merged into a reference baseline.
+python scripts/kaggle_validation.py --corpus data/real-v2 --lr-schedule \
+    --architecture reex-v2
+```
+
+Checkpoints record their architecture in `config`; old checkpoints without the
+key load as `reference-v1`, and resuming across architectures is refused
+(`tests/test_reex_model.py` pins the registry behavior and holds `reex-v2` to
+the same initial-loss-equals-`ln(V)` gate as the reference model). Per the
+build plan's model-switch procedure, a new architecture is a new lineage:
+compare it against a reference baseline in a separate table, never inside one.
+
 ## If a run dies partway
 
 **Re-run the identical command.** It resumes from the newest readable

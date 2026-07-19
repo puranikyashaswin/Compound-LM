@@ -32,6 +32,31 @@ def masked_next_token_loss(logits, ids, document_ids):
     return torch.nn.functional.cross_entropy(pred_logits, masked_targets, ignore_index=ignore_index)
 
 
+# Floating-point results that agree to this many relative units are the same
+# measurement. Exact equality was never a sound contract: summing a held-out
+# set in a different batch order changes the last ~7 digits, as does a
+# different GPU kernel. The build plan calls for a declared tolerance rather
+# than byte equality, and this is it. It is tight enough that any real
+# divergence -- a different data order, a different seed, a different
+# precision -- lands orders of magnitude outside it.
+REPLAY_TOLERANCE = 1e-6
+
+
+def _measurements_agree(prior: object, current: object) -> bool:
+    """Compare replayed measurements up to floating-point reduction order."""
+    if isinstance(prior, dict) and isinstance(current, dict):
+        return prior.keys() == current.keys() and all(
+            _measurements_agree(prior[key], current[key]) for key in prior
+        )
+    if isinstance(prior, bool) or isinstance(current, bool):
+        return prior == current
+    if isinstance(prior, (int, float)) and isinstance(current, (int, float)):
+        if math.isnan(prior) or math.isnan(current):
+            return math.isnan(prior) and math.isnan(current)
+        return abs(prior - current) <= REPLAY_TOLERANCE * max(1.0, abs(prior), abs(current))
+    return prior == current
+
+
 def _append_or_verify_replay(ledger_path: str, entry: dict) -> None:
     """Append a ledger row, tolerating an identical deterministic replay.
 
@@ -54,7 +79,7 @@ def _append_or_verify_replay(ledger_path: str, entry: dict) -> None:
         return
     measured = ("final_loss", "eval_scores")
     disagreements = {key: (prior.get(key), entry.get(key)) for key in measured
-                     if prior.get(key) != entry.get(key)}
+                     if not _measurements_agree(prior.get(key), entry.get(key))}
     if disagreements:
         raise ValueError(
             f"ledger contradiction: {entry['run_id']} at {entry['tokens']} tokens was already "
@@ -118,12 +143,17 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
           muon_lr: float = 0.02,
           heldout_shard: str | None = None, levers_on: list[str] | None = None,
           batch_size: int = 1, lr_schedule: bool = False,
-          warmup_fraction: float = 0.01, min_lr_fraction: float = 0.1) -> dict:
+          warmup_fraction: float = 0.01, min_lr_fraction: float = 0.1,
+          architecture: str = "reference-v1", precision: str = "fp32",
+          compile_model: bool = False, grad_clip: float | None = None,
+          weight_decay: float = 0.01, eval_batch_size: int = 32) -> dict:
     require_torch()
     import torch
-    from src.model.reference import ReferenceLM
+    from src.model.registry import build_model
     from src.data.contamination import assert_disjoint_shards
-    
+    from src.train.systems import (SystemsPolicy, apply_backend_flags, make_grad_scaler,
+                                   maybe_compile, resolve_precision)
+
     # 1. Run automatic contamination check
     if heldout_shard:
         assert_disjoint_shards(shard, heldout_shard)
@@ -131,9 +161,48 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     random.seed(seed); torch.manual_seed(seed)
     rows = open_shard(shard)
 
-    model = ReferenceLM(vocab_size, d_model, n_layers, n_heads, rows.sequence_length)
+    model = build_model(architecture, vocab_size=vocab_size, d_model=d_model,
+                        n_layers=n_layers, n_heads=n_heads,
+                        max_seq_len=rows.sequence_length)
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    # Systems lever: same mathematics, fewer seconds per step. Default fp32
+    # preserves every result already in the ledger; speed is opt-in.
+    policy = SystemsPolicy(precision=precision, compile=compile_model, device=device)
+    resolved = resolve_precision(policy, device=device)
+    apply_backend_flags(resolved)
+    autocast_dtype = getattr(torch, resolved.autocast_dtype) if resolved.autocast_dtype else None
+    scaler = make_grad_scaler(device, enabled=resolved.use_grad_scaler)
+    for note in resolved.notes:
+        print(f"[systems] {note}")
+
+    named = dict(model.named_parameters())
+
+    def _decay_groups(names: list[str]) -> list[dict]:
+        """Split into decayed matrices and undecayed norms/biases/1-D tensors.
+
+        Weight decay on LayerNorm/RMSNorm gains and biases pulls them toward
+        zero for no regularization benefit -- it fights the normalization the
+        architecture depends on. Every serious recipe excludes them; PyTorch's
+        AdamW default does not, so it has to be done here.
+        """
+        decay = [n for n in names if named[n].ndim >= 2]
+        no_decay = [n for n in names if named[n].ndim < 2]
+        return [{"params": [named[n] for n in decay], "weight_decay": weight_decay},
+                {"params": [named[n] for n in no_decay], "weight_decay": 0.0}]
+
+    def _adamw(names: list[str]):
+        # Fused AdamW folds the elementwise update into one kernel; on a small
+        # model the optimizer step is a real fraction of step time.
+        groups = _decay_groups(names)
+        if policy.fused_optimizer and device == "cuda":
+            try:
+                return torch.optim.AdamW(groups, lr=learning_rate, fused=True)
+            except (RuntimeError, TypeError):
+                pass
+        return torch.optim.AdamW(groups, lr=learning_rate)
+
+    optimizer = _adamw(list(named))
     muon_optimizer = None
     optimizer_groups = {"adamw": [name for name, _ in model.named_parameters()], "muon": []}
     if use_muon:
@@ -141,9 +210,11 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         partition = partition_named_parameters(model.named_parameters())
         by_name = dict(model.named_parameters())
         muon_optimizer = Muon([by_name[name] for name in partition.muon], lr=muon_lr)
-        optimizer = torch.optim.AdamW([by_name[name] for name in partition.adamw], lr=learning_rate)
+        optimizer = _adamw(list(partition.adamw))
         optimizer_groups = {"adamw": list(partition.adamw), "muon": list(partition.muon)}
-    
+
+    compiled_model, _ = maybe_compile(model, policy)
+
     losses = []
     start_step = 0
     data_position = 0
@@ -153,6 +224,12 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         state = torch.load(resume, map_location=device, weights_only=False)
         if bool(state.get("use_muon", False)) != use_muon:
             raise ValueError("resume checkpoint optimizer mode does not match requested use_muon")
+        # An architecture mismatch is a lineage break, not a resume.
+        checkpoint_arch = state.get("config", {}).get("architecture", "reference-v1")
+        if checkpoint_arch != architecture:
+            raise ValueError(
+                f"resume checkpoint architecture is {checkpoint_arch!r}, not {architecture!r}"
+            )
         # The recorded loader provenance must match this call, or the resumed
         # curve would silently continue over different data than it began on.
         checkpoint_shard = state.get("shard")
@@ -160,6 +237,16 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
             raise ValueError(
                 f"resume checkpoint was trained on shard {checkpoint_shard}, not {Path(shard).resolve()}"
             )
+        # Precision changes the numerics, so a resumed curve that switched
+        # precision is not the curve it claims to continue.
+        checkpoint_precision = state.get("precision")
+        if checkpoint_precision is not None and checkpoint_precision != resolved.autocast_dtype:
+            raise ValueError(
+                f"resume checkpoint was trained at precision {checkpoint_precision!r}, "
+                f"not {resolved.autocast_dtype!r}"
+            )
+        if state.get("scaler") is not None and scaler.is_enabled():
+            scaler.load_state_dict(state["scaler"])
         checkpoint_batch_size = state.get("batch_size")
         if checkpoint_batch_size is not None and int(checkpoint_batch_size) != batch_size:
             raise ValueError(
@@ -220,7 +307,9 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
                    # disagree with the checkpoint about where the data resumes.
                    "shard": str(Path(shard).resolve()),
                    "data_position": data_position,
-                   "batch_size": batch_size}
+                   "batch_size": batch_size,
+                   "precision": resolved.autocast_dtype,
+                   "scaler": scaler.state_dict() if scaler.is_enabled() else None}
         _write_checkpoint(payload, target)
         return target
 
@@ -245,23 +334,48 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
                 for group in muon_optimizer.param_groups:
                     group["lr"] = muon_lr * scale
 
-        logits = model(ids, docs)
-        
-        # Use masked target cross entropy loss
-        loss = masked_next_token_loss(logits, ids, docs)
-        
+        if autocast_dtype is not None:
+            with torch.autocast(device_type=device, dtype=autocast_dtype):
+                logits = compiled_model(ids, docs)
+                loss = masked_next_token_loss(logits, ids, docs)
+        else:
+            logits = compiled_model(ids, docs)
+            loss = masked_next_token_loss(logits, ids, docs)
+
         optimizer.zero_grad(set_to_none=True)
         if muon_optimizer is not None:
             muon_optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9).detach().cpu())
+        scaler.scale(loss).backward()
+
+        # Unscale before reading the gradient norm. fp16 loss scaling multiplies
+        # gradients by ~2^16; measuring the norm first would feed the health gate
+        # a number three orders of magnitude off and trip the spike check on a
+        # perfectly healthy run. Muon is unscaled explicitly because GradScaler
+        # only touches the optimizers it is handed.
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
+            if muon_optimizer is not None:
+                scaler.unscale_(muon_optimizer)
+
+        # 1e9 is not clipping, it is measuring: the returned norm is the value
+        # before any clipping, so the default keeps the health gate's reading
+        # while leaving updates untouched. A real grad_clip (1.0 is standard)
+        # bounds the update and is what lets a higher learning rate stay
+        # stable -- but it changes the numbers, so it stays opt-in.
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(
+            model.parameters(), grad_clip if grad_clip is not None else 1e9).detach().cpu())
         grad_history.add(grad_norm)
-        
-        optimizer.step()
-        if muon_optimizer is not None:
-            muon_optimizer.step()
-        
+
+        if scaler.is_enabled():
+            scaler.step(optimizer)
+            if muon_optimizer is not None:
+                scaler.step(muon_optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+            if muon_optimizer is not None:
+                muon_optimizer.step()
+
         current_loss = float(loss.detach().cpu())
         losses.append(current_loss)
         
@@ -279,7 +393,8 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
             eval_scores: dict = {}
             if heldout_shard:
                 from src.eval.intrinsic import evaluate
-                eval_scores = evaluate(str(checkpoint), heldout_shard, device=device)
+                eval_scores = evaluate(str(checkpoint), heldout_shard, device=device,
+                                     batch_size=eval_batch_size)
                 eval_scores["smoke"] = eval_scores["val_acc"]  # higher-is-better headline score
             
             tokens = (step + 1) * batch_size * rows.sequence_length
@@ -318,7 +433,8 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     eval_scores = {}
     if heldout_shard:
         from src.eval.intrinsic import evaluate
-        eval_scores = evaluate(str(checkpoint), heldout_shard, device=device)
+        eval_scores = evaluate(str(checkpoint), heldout_shard, device=device,
+                                     batch_size=eval_batch_size)
         eval_scores["smoke"] = eval_scores["val_acc"]
         
     tokens = final_step * batch_size * rows.sequence_length
@@ -327,7 +443,10 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     result = {"checkpoint": str(checkpoint), "steps": final_step, "losses": losses,
               "final_loss": final_loss, "seed": seed, "health": report.as_dict(),
               "checkpoint_hash": checkpoint_hash, "optimizer_groups": optimizer_groups,
-              "use_muon": use_muon, "eval_scores": eval_scores, "train_flops": train_flops}
+              "use_muon": use_muon, "eval_scores": eval_scores, "train_flops": train_flops,
+              "architecture": architecture, "systems": resolved.as_dict(),
+              "grad_clip": grad_clip, "weight_decay": weight_decay,
+              "eval_batch_size": eval_batch_size}
               
     return result
 
@@ -340,11 +459,13 @@ def main() -> None:
     parser.add_argument("--ledger"); parser.add_argument("--run-id")
     parser.add_argument("--use-muon", action="store_true")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--architecture", default="reference-v1")
     args = parser.parse_args()
     print(json.dumps(train(args.shard, args.output_dir, steps=args.steps, device=args.device,
                            resume=args.resume, checkpoint_every=args.checkpoint_every,
                            ledger_path=args.ledger, run_id=args.run_id,
-                           use_muon=args.use_muon, batch_size=args.batch_size), indent=2))
+                           use_muon=args.use_muon, batch_size=args.batch_size,
+                           architecture=args.architecture), indent=2))
 
 
 if __name__ == "__main__":

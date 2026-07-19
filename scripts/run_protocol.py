@@ -72,7 +72,8 @@ def build_shards():
     return shards
 
 
-def run_one(name, shard, heldout, *, seed, use_muon, levers, params):
+def run_one(name, shard, heldout, *, seed, use_muon, levers, params,
+            architecture="reference-v1"):
     """Train a run and build its (cost, score) curve from every checkpoint."""
     from src.eval.intrinsic import evaluate
     from src.train.reference import train
@@ -80,7 +81,8 @@ def run_one(name, shard, heldout, *, seed, use_muon, levers, params):
     out_dir = ROOT / "runs" / name
     result = train(shard, str(out_dir), **MODEL, steps=STEPS, seed=seed, device="cpu",
                    checkpoint_every=CHECKPOINT_EVERY, heldout_shard=heldout,
-                   use_muon=use_muon, levers_on=levers, batch_size=BATCH_SIZE)
+                   use_muon=use_muon, levers_on=levers, batch_size=BATCH_SIZE,
+                   architecture=architecture)
     # Real capability-at-cost curve: cost = 6·N·tokens = 6·N·(SEQ_LEN·batch·step) FLOPs.
     curve = []
     for ckpt in sorted(out_dir.glob("checkpoint-*.pt")):
@@ -134,9 +136,9 @@ def write_summary(evidence: dict) -> None:
                           text.split(end, 1)[1], encoding="utf-8")
 
 
-def count_params():
-    from src.model.reference import ReferenceLM
-    m = ReferenceLM(**MODEL, max_seq_len=SEQ_LEN)
+def count_params(architecture="reference-v1"):
+    from src.model.registry import build_model
+    m = build_model(architecture, **MODEL, max_seq_len=SEQ_LEN)
     return sum(p.numel() for p in m.parameters())
 
 
@@ -156,7 +158,8 @@ def main():
     print(f"   train tokens={shards['train']['tokens']} heldout tokens={shards['heldout']['tokens']}")
 
     params = count_params()
-    print(f"   model params={params:,}")
+    reex_params = count_params("reex-v2")
+    print(f"   model params: reference-v1={params:,} reex-v2={reex_params:,}")
 
     print("== 2. Two-seed baseline (A0/A1) ==")
     a0 = run_one("baseline-s17", train_shard, heldout, seed=17, use_muon=False, levers=[], params=params)
@@ -172,8 +175,24 @@ def main():
                    levers=["optimizer"], params=params)
     print(f"   acc s17={opt0['final']['val_acc']:.4f} s23={opt1['final']['val_acc']:.4f}")
 
-    print("== 4. Capability-at-cost — M(S) at common target ==")
-    runs = [a0, a1, opt0, opt1]
+    print("== 4. Architecture lever (Reex-v2: RoPE + RMSNorm + SwiGLU) ==")
+    arch0 = run_one("architecture-s17", train_shard, heldout, seed=17, use_muon=False,
+                    levers=["architecture"], params=reex_params, architecture="reex-v2")
+    arch1 = run_one("architecture-s23", train_shard, heldout, seed=23, use_muon=False,
+                    levers=["architecture"], params=reex_params, architecture="reex-v2")
+    print(f"   acc s17={arch0['final']['val_acc']:.4f} s23={arch1['final']['val_acc']:.4f}")
+
+    print("== 5. Compound arm (architecture + optimizer) ==")
+    both0 = run_one("compound-s17", train_shard, heldout, seed=17, use_muon=True,
+                    levers=["architecture", "optimizer"], params=reex_params,
+                    architecture="reex-v2")
+    both1 = run_one("compound-s23", train_shard, heldout, seed=23, use_muon=True,
+                    levers=["architecture", "optimizer"], params=reex_params,
+                    architecture="reex-v2")
+    print(f"   acc s17={both0['final']['val_acc']:.4f} s23={both1['final']['val_acc']:.4f}")
+
+    print("== 6. Capability-at-cost — M(S) at common target ==")
+    runs = [a0, a1, opt0, opt1, arch0, arch1, both0, both1]
     max_reached = min(max(pt["score"] for pt in r["curve"]) for r in runs)
     if max_reached <= 0:
         raise SystemExit(
@@ -206,7 +225,8 @@ def main():
     evidence = {
         "schema_version": 1,
         "model": MODEL, "sequence_length": SEQ_LEN, "steps": STEPS,
-        "params": params,
+        "params": params, "reex_params": reex_params,
+        "architectures": {"baseline": "reference-v1", "architecture_lever": "reex-v2"},
         "shards": shards,
         "baseline": {"seeds": [a0["final"], a1["final"]], "seed_spread_acc": seed_spread,
                      "gate_pass": seed_spread <= 0.15},

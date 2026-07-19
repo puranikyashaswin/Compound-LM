@@ -22,9 +22,9 @@ from src.data.binshard import PackedShard
 from src.data.budget import check_token_budget
 
 
-def count_params(model_config: dict, sequence_length: int) -> int:
-    from src.model.reference import ReferenceLM
-    model = ReferenceLM(**model_config, max_seq_len=sequence_length)
+def count_params(model_config: dict, sequence_length: int, architecture: str = "reference-v1") -> int:
+    from src.model.registry import build_model
+    model = build_model(architecture, **model_config, max_seq_len=sequence_length)
     return sum(p.numel() for p in model.parameters())
 
 def main():
@@ -42,6 +42,26 @@ def main():
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--muon-lr", type=float, default=0.02)
+    parser.add_argument("--precision", default="fp32",
+                        help="fp32 (default, matches the existing ledger), or auto/bf16/fp16 "
+                             "for the systems lever. 'auto' picks bf16 on Ampere+ and "
+                             "fp16+GradScaler on Turing (Kaggle T4), never fp32 on a GPU.")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the model; verify throughput per GPU class")
+    parser.add_argument("--grad-clip", type=float, default=None,
+                        help="Clip gradients to this norm (1.0 is standard). Default off, "
+                             "which reproduces the existing ledger; the old call site "
+                             "clipped at 1e9, i.e. measured the norm without clipping.")
+    parser.add_argument("--weight-decay", type=float, default=0.01,
+                        help="Applied to 2-D tensors only; norms and biases are exempt")
+    parser.add_argument("--eval-batch-size", type=int, default=32,
+                        help="Held-out evaluation batch size; affects speed, not scores")
+    parser.add_argument("--architecture", default="reference-v1",
+                        help="Model architecture for the whole matrix: reference-v1 or "
+                             "reex-v2 (RoPE + RMSNorm + SwiGLU). A non-reference "
+                             "architecture is recorded as an 'architecture' lever, so "
+                             "compare its ledger against a reference-v1 baseline ledger, "
+                             "never within one.")
     parser.add_argument("--lr-schedule", action="store_true",
                         help="Warmup + cosine decay, applied identically to every arm")
     parser.add_argument("--max-epochs", type=float, default=4.0,
@@ -104,7 +124,7 @@ def main():
     # 2. Token-budget gate BEFORE any GPU time is spent. The previous run of
     #    this script looped a 1.67M-token corpus 270 times for 3.6 GPU-hours
     #    and could only measure memorization; no other gate here catches that.
-    n_params = count_params(MODEL_CONFIG, train_shard.sequence_length)
+    n_params = count_params(MODEL_CONFIG, train_shard.sequence_length, args.architecture)
     budget = check_token_budget(unique_tokens=train_shard.meta["real_tokens"],
                                 steps=args.steps, batch_size=args.batch_size,
                                 sequence_length=train_shard.sequence_length,
@@ -130,9 +150,12 @@ def main():
 
     checkpoint_every = args.checkpoint_every
 
+    arch_lever = [] if args.architecture == "reference-v1" else ["architecture"]
+
     def run_one(name, seed, use_muon):
-        run_id = f"gpu-{name}-s{seed}"
-        out_dir = run_dir / f"{name}-s{seed}"
+        run_id = f"gpu-{name}-s{seed}" if not arch_lever else f"gpu-{args.architecture}-{name}-s{seed}"
+        out_dir = run_dir / (f"{name}-s{seed}" if not arch_lever
+                             else f"{args.architecture}-{name}-s{seed}")
 
         # Auto-resume: a crashed or timed-out session costs one checkpoint
         # interval, not the whole run. Re-running the same command continues.
@@ -166,10 +189,16 @@ def main():
             use_muon=use_muon,
             muon_lr=args.muon_lr,
             lr_schedule=args.lr_schedule,
-            levers_on=["optimizer"] if use_muon else [],
+            levers_on=arch_lever + (["optimizer"] if use_muon else []),
             ledger_path=str(ledger_path),
             run_id=run_id,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            architecture=args.architecture,
+            precision=args.precision,
+            compile_model=args.compile,
+            grad_clip=args.grad_clip,
+            weight_decay=args.weight_decay,
+            eval_batch_size=args.eval_batch_size
         )
         elapsed = time.perf_counter() - start
         print(f"Finished {run_id} in {elapsed:.1f}s.")
