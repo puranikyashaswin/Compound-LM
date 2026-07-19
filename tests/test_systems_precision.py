@@ -44,6 +44,46 @@ def test_resolved_precision_serializes_for_the_ledger():
     assert isinstance(payload["notes"], list)
 
 
+def test_turing_does_not_get_emulated_bf16(monkeypatch):
+    """Regression: a Tesla T4 measured 0.75x because torch claimed bf16.
+
+    torch.cuda.is_bf16_supported() counts *emulated* bf16, so Turing (SM 7.5)
+    reports True while having no bf16 tensor cores. Selecting it there is
+    slower than fp32 -- measured 0.73-0.77x across three tensor sizes on a T4.
+    Native bf16 begins at Ampere (SM 8.0).
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda *a, **k: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (7, 5))
+
+    resolved = resolve_precision(SystemsPolicy(precision="auto"), device="cuda")
+    assert resolved.autocast_dtype == "float16", (
+        "Turing must use fp16 tensor cores, not emulated bf16")
+    assert resolved.use_grad_scaler is True
+    assert any("emulation" in note for note in resolved.notes)
+
+
+def test_ampere_gets_native_bf16(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda *a, **k: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 0))
+
+    resolved = resolve_precision(SystemsPolicy(precision="auto"), device="cuda")
+    assert resolved.autocast_dtype == "bfloat16"
+    assert resolved.use_grad_scaler is False
+
+
+def test_pascal_is_warned_about_missing_tensor_cores(monkeypatch):
+    """Kaggle's P100 is SM 6.0: fp16 runs, but there are no tensor cores."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda *a, **k: False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (6, 0))
+
+    resolved = resolve_precision(SystemsPolicy(precision="auto"), device="cuda")
+    assert resolved.autocast_dtype == "float16"
+    assert any("tensor cores" in note for note in resolved.notes)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_gpu_auto_never_falls_back_to_fp32():
     """On any tensor-core GPU, 'auto' must select a half-precision path."""

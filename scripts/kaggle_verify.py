@@ -80,7 +80,11 @@ def main() -> None:
     print("=" * 70)
     print("MIXED PRECISION vs fp32")
     print("=" * 70)
-    print(f"{'shape':<28} {'fp32 ms':>9} {'amp ms':>9} {'speedup':>9} {'loss div':>10}")
+    # fp16 and bf16 are measured separately, never only via 'auto'. A T4 run
+    # that tested 'auto' alone reported 0.75x and hid the cause: torch claimed
+    # bf16 support that was really emulation, and the genuinely fast path
+    # (fp16 tensor cores) was never exercised.
+    print(f"{'shape':<26} {'fp32 ms':>9} {'fp16':>14} {'bf16':>14}")
     print("-" * 70)
 
     records = []
@@ -88,20 +92,38 @@ def main() -> None:
         try:
             fp32_ms, fp32_losses, _ = bench_steps("cuda", "fp32", steps=args.steps,
                                                   warmup=args.warmup, **shape)
-            amp_ms, amp_losses, amp_resolved = bench_steps("cuda", "auto", steps=args.steps,
-                                                          warmup=args.warmup, **shape)
         except RuntimeError as error:
-            print(f"{label:<28} skipped: {error}")
+            print(f"{label:<26} skipped: {error}")
             continue
-        speedup = fp32_ms / amp_ms
-        divergence = max(abs(a - b) / max(1.0, abs(a))
-                         for a, b in zip(fp32_losses, amp_losses))
-        records.append({"shape": label, "config": shape, "fp32_ms": fp32_ms * 1000,
-                        "amp_ms": amp_ms * 1000, "speedup": speedup,
-                        "loss_divergence": divergence,
-                        "dtype": amp_resolved.autocast_dtype})
-        print(f"{label:<28} {fp32_ms*1000:9.1f} {amp_ms*1000:9.1f} "
-              f"{speedup:8.2f}x {divergence:10.2e}")
+
+        row = {"shape": label, "config": shape, "fp32_ms": fp32_ms * 1000, "variants": {}}
+        cells = []
+        for precision in ("fp16", "bf16"):
+            try:
+                amp_ms, amp_losses, amp_resolved = bench_steps(
+                    "cuda", precision, steps=args.steps, warmup=args.warmup, **shape)
+            except RuntimeError as error:
+                cells.append(f"{'err':>14}")
+                row["variants"][precision] = {"error": str(error)}
+                continue
+            speedup = fp32_ms / amp_ms
+            divergence = max(abs(a - b) / max(1.0, abs(a))
+                             for a, b in zip(fp32_losses, amp_losses))
+            row["variants"][precision] = {
+                "ms": amp_ms * 1000, "speedup": speedup,
+                "loss_divergence": divergence,
+                "resolved_dtype": amp_resolved.autocast_dtype}
+            cells.append(f"{speedup:8.2f}x{'':>5}")
+        records.append(row)
+        print(f"{label:<26} {fp32_ms*1000:9.1f} {''.join(cells)}")
+
+    print()
+    for row in records:
+        for precision, data in row["variants"].items():
+            if "error" not in data:
+                print(f"  {row['shape']:<26} {precision}: {data['speedup']:.2f}x  "
+                      f"loss divergence {data['loss_divergence']:.2e}  "
+                      f"(ran as {data['resolved_dtype']})")
 
     if not records:
         raise SystemExit("every shape failed to run; nothing measured")
@@ -133,10 +155,23 @@ def main() -> None:
     print("=" * 70)
     print("VERDICT")
     print("=" * 70)
-    best = max(record["speedup"] for record in records)
-    worst_divergence = max(record["loss_divergence"] for record in records)
-    print(f"  mixed precision on {name}: up to {best:.2f}x")
+    measured = [(row["shape"], precision, data)
+                for row in records for precision, data in row["variants"].items()
+                if "error" not in data]
+    if not measured:
+        raise SystemExit("no precision variant ran successfully")
+    best_shape, best_precision, best_data = max(measured, key=lambda item: item[2]["speedup"])
+    best = best_data["speedup"]
+    worst_divergence = max(data["loss_divergence"] for _, _, data in measured)
+    print(f"  fastest precision on {name}: {best_precision} at {best:.2f}x "
+          f"({best_shape.strip()})")
     print(f"  max loss divergence vs fp32: {worst_divergence:.2e}")
+
+    auto_dtype = resolved.autocast_dtype
+    best_dtype = best_data["resolved_dtype"]
+    if auto_dtype != best_dtype:
+        print(f"  WARNING: policy 'auto' picks {auto_dtype} but {best_dtype} measured "
+              f"faster here. resolve_precision needs updating for this GPU.")
 
     equivalence_ok = worst_divergence <= 0.05
     print(f"  equivalence (loss tracks fp32): {'PASS' if equivalence_ok else 'FAIL'}")

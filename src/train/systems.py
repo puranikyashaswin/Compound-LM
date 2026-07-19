@@ -108,8 +108,20 @@ def resolve_precision(policy: SystemsPolicy, device: str = "cuda") -> ResolvedPr
         return ResolvedPrecision(None, False, False, requested, tuple(notes))
 
     if device == "cuda" and torch.cuda.is_available():
-        bf16_ok = torch.cuda.is_bf16_supported()
-        fp16_ok = True
+        # Do NOT trust torch.cuda.is_bf16_supported(): recent versions count
+        # *emulated* bf16, so a Tesla T4 (Turing, SM 7.5) reports True. Emulated
+        # bf16 runs without tensor cores and is slower than fp32 -- measured
+        # 0.73-0.77x on a T4 across three tensor sizes, which is how this was
+        # found. Native bf16 starts at Ampere (SM 8.0); below that, fp16 is the
+        # fast path because Turing and Volta do have fp16 tensor cores.
+        major, _minor = torch.cuda.get_device_capability()
+        bf16_ok = major >= 8
+        fp16_ok = major >= 7  # tensor cores from Volta onward
+        if not bf16_ok and torch.cuda.is_bf16_supported():
+            notes.append(
+                f"torch reports bf16 supported on compute capability {major}.{_minor}, "
+                "but that is emulation without tensor cores and measures slower than "
+                "fp32; treating bf16 as unavailable")
     else:
         if requested not in ("fp32", "auto"):
             notes.append(f"{requested} requested but device is {device}; using fp32")
@@ -124,7 +136,11 @@ def resolve_precision(policy: SystemsPolicy, device: str = "cuda") -> ResolvedPr
                          "which is the fast path here -- fp32 would forfeit the tensor cores")
         else:
             chosen, scaler = "float16", True
-            notes.append("auto: bf16 unsupported; selected fp16 + GradScaler")
+            notes.append("auto: no native bf16 (pre-Ampere); selected fp16 + GradScaler")
+        if chosen == "float16" and not fp16_ok:
+            notes.append(
+                "this GPU predates Volta and has no tensor cores at all; expect "
+                "little or no speedup from mixed precision")
     elif requested == "fp16":
         chosen, scaler = "float16", fp16_ok
     elif requested == "fp32":
