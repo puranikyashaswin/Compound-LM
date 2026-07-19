@@ -183,7 +183,13 @@ def main() -> None:
                              "schedule spans this, so keep it fixed between sessions")
     parser.add_argument("--max-hours", type=float, default=8.0,
                         help="Stop and upload before the session limit kills the run")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=2,
+                        help="MICRO-batch. Activation peak is set by this. At 193M with a "
+                             "50257 head and eager attention (the document mask disables "
+                             "flash), batch 8 x seq 1024 needs 13.6GB and OOMs a 14.6GB T4.")
+    parser.add_argument("--grad-accum", type=int, default=4,
+                        help="Micro-batches per optimizer step. batch 2 x accum 4 = the "
+                             "same effective batch 8, at a quarter of the activation peak.")
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1.5e-4)
     parser.add_argument("--warmup-fraction", type=float, default=0.01)
@@ -281,7 +287,7 @@ def main() -> None:
         heldout_shard=shards["heldout"]["packed"], use_muon=args.use_muon,
         batch_size=args.batch_size, lr_schedule=True,
         warmup_fraction=args.warmup_fraction, precision=args.precision,
-        grad_clip=args.grad_clip, keep_checkpoints=3,
+        grad_clip=args.grad_clip, keep_checkpoints=3, grad_accum=args.grad_accum,
         ledger_path=str(ledger), run_id="reex-1.5",
         levers_on=["growth"] + (["optimizer"] if args.use_muon else []),
         model_override=model,

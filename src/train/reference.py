@@ -172,7 +172,7 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
           keep_checkpoints: int | None = None,
           init_from: str | None = None, model_override=None,
           max_seconds: float | None = None,
-          on_checkpoint=None) -> dict:
+          on_checkpoint=None, grad_accum: int = 1) -> dict:
     require_torch()
     import torch
     from src.model.registry import build_model
@@ -378,6 +378,9 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     model.train()
     started = time.perf_counter()
     stopped_early = False
+    micro_step = 0
+    if grad_accum < 1:
+        raise ValueError('grad_accum must be at least 1')
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
 
     def _write_checkpoint(payload: dict, target: Path, attempts: int = 3) -> None:
@@ -469,6 +472,16 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
                 for group in muon_optimizer.param_groups:
                     group["lr"] = muon_lr * scale
 
+        # Gradient accumulation: several small forward/backward passes before one
+        # optimizer step. The activation peak is set by the MICRO-batch, so this
+        # is what makes a 193M model with a 50257-vocab head and eager attention
+        # fit a 14.6GB T4 while keeping the effective batch large enough to
+        # train stably.
+        if micro_step == 0:
+            optimizer.zero_grad(set_to_none=True)
+            if muon_optimizer is not None:
+                muon_optimizer.zero_grad(set_to_none=True)
+
         if autocast_dtype is not None:
             with torch.autocast(device_type=device, dtype=autocast_dtype):
                 logits = compiled_model(ids, docs)
@@ -477,10 +490,16 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
             logits = compiled_model(ids, docs)
             loss = masked_next_token_loss(logits, ids, docs)
 
-        optimizer.zero_grad(set_to_none=True)
-        if muon_optimizer is not None:
-            muon_optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
+        # Mean over accumulated micro-batches, so the gradient matches what a
+        # single large batch would have produced.
+        scaler.scale(loss / grad_accum).backward()
+        del logits
+
+        micro_step += 1
+        if micro_step < grad_accum:
+            losses.append(float(loss.detach().cpu()))
+            continue
+        micro_step = 0
 
         # Unscale before reading the gradient norm. fp16 loss scaling multiplies
         # gradients by ~2^16; measuring the norm first would feed the health gate
