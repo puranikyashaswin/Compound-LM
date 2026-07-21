@@ -38,3 +38,18 @@ def test_invalidate_corpus_clears_marker_and_shards(tmp_path):
     (tmp_path / "corpus.json").write_text("{}")
     _invalidate_corpus(tmp_path)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_reusable_gate_rejects_undersized_single_doc_corpus(tmp_path):
+    from scripts.train_reex15 import _corpus_is_reusable
+
+    write_packed_shard(DOCS, tmp_path / "reex15-train-bin", sequence_length=4,
+                       vocab_size=64, tokenizer_id="test", cross_document=False)
+    write_packed_shard(DOCS, tmp_path / "reex15-heldout-bin", sequence_length=4,
+                       vocab_size=64, tokenizer_id="test", cross_document=False)
+    (tmp_path / "corpus.json").write_text(json.dumps({
+        "train": {"packed": str(tmp_path / "reex15-train-bin"), "tokens": 60_000_000},
+        "heldout": {"packed": str(tmp_path / "reex15-heldout-bin"), "tokens": 1},
+    }))
+    assert not _corpus_is_reusable(tmp_path, target_tokens=500_000_000)
+    assert _corpus_is_reusable(tmp_path, target_tokens=60_000_000)

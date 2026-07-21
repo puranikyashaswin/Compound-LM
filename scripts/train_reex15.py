@@ -89,6 +89,31 @@ def _derive_total_steps(target_tokens: float, batch_size: int, seq_len: int,
     return total_steps
 
 
+def _corpus_train_tokens(out_dir: Path) -> int | None:
+    marker = Path(out_dir) / "corpus.json"
+    if not marker.exists():
+        return None
+    try:
+        shards = json.loads(marker.read_text())
+        return int(shards["train"]["tokens"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _corpus_is_reusable(out_dir: Path, *, target_tokens: int) -> bool:
+    """Refuse multi-doc packs and corpora that undershoot the requested size."""
+    if not _corpus_allows_sdpa_fast_path(out_dir):
+        return False
+    tokens = _corpus_train_tokens(out_dir)
+    if tokens is None:
+        return False
+    # Allow 5% shortfall for stream exhaustion; refuse the 60M leftover when
+    # the job asks for 500M.
+    if tokens < int(target_tokens * 0.95):
+        return False
+    return True
+
+
 def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
                  sequence_length: int, vocab_size: int, heldout_documents: int = 2000,
                  sync=None) -> dict:
@@ -120,8 +145,10 @@ def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     marker = out_dir / "corpus.json"
-    if marker.exists() and not _corpus_allows_sdpa_fast_path(out_dir):
-        print("   local corpus packs multiple docs per sequence; rebuilding for SDPA")
+    if marker.exists() and not _corpus_is_reusable(out_dir, target_tokens=target_tokens):
+        have = _corpus_train_tokens(out_dir)
+        print(f"   local corpus unusable for this run "
+              f"(tokens={have}, need>={int(target_tokens * 0.95):,}); rebuilding")
         _invalidate_corpus(out_dir)
     if marker.exists():
         print("   reusing corpus already built in this session")
@@ -131,11 +158,13 @@ def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
     # identical corpus is rebuilt every time -- ~35 minutes each, four times.
     # Downloading the shards back costs a couple of minutes instead.
     if sync is not None and sync.pull_corpus(out_dir):
-        if marker.exists() and _corpus_allows_sdpa_fast_path(out_dir):
+        if marker.exists() and _corpus_is_reusable(out_dir, target_tokens=target_tokens):
             print("   corpus restored from the Hub (skipped rebuild)")
             return json.loads(marker.read_text())
         if marker.exists():
-            print("   Hub corpus packs multiple docs per sequence; rebuilding for SDPA")
+            have = _corpus_train_tokens(out_dir)
+            print(f"   Hub corpus unusable for this run "
+                  f"(tokens={have}, need>={int(target_tokens * 0.95):,}); rebuilding")
             _invalidate_corpus(out_dir)
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -279,7 +308,10 @@ def main() -> None:
                              "tokens each time costs ~5 GPU-hours across the job. The "
                              "session-end eval always uses the full set.")
     parser.add_argument("--sync-interval-min", type=float, default=25.0)
-    parser.add_argument("--corpus-tokens", type=int, default=60_000_000)
+    parser.add_argument("--corpus-tokens", type=int, default=500_000_000,
+                        help="Unique training tokens to pack. 60M fails the budget gate "
+                             "for the 1.86B-token Reex-1.5 job; 500M matches the prior "
+                             "AMBER plan (~3.7 epochs).")
     parser.add_argument("--skip-documents", type=int, default=2_400_000,
                         help="Documents Reex-1 consumed; skipped so this trains on new text")
     parser.add_argument("--use-muon", action="store_true")
