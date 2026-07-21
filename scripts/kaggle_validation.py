@@ -42,12 +42,12 @@ def main():
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--muon-lr", type=float, default=0.02)
-    parser.add_argument("--precision", default="fp32",
-                        help="fp32 (default, matches the existing ledger), or auto/bf16/fp16 "
-                             "for the systems lever. 'auto' picks bf16 on Ampere+ and "
-                             "fp16+GradScaler on Turing (Kaggle T4), never fp32 on a GPU.")
-    parser.add_argument("--compile", action="store_true",
-                        help="torch.compile the model; verify throughput per GPU class")
+    parser.add_argument("--precision", default="auto",
+                        help="systems-v2 default: auto picks bf16 on Ampere+ and "
+                             "fp16+GradScaler on Turing (Kaggle T4). Use --precision fp32 "
+                             "to match pre-systems-v2 ledger rows.")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                        help="torch.compile the model (default on); --no-compile disables")
     parser.add_argument("--grad-clip", type=float, default=None,
                         help="Clip gradients to this norm (1.0 is standard). Default off, "
                              "which reproduces the existing ledger; the old call site "

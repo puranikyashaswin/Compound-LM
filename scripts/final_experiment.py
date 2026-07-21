@@ -85,7 +85,8 @@ def build_corpus(out_dir: Path, *, target_tokens: int, vocab_size: int,
             prefix = out_dir / f"final-{name}-bin"
             convert_jsonl_shard(documents_jsonl, prefix, vocab_size=vocab_size,
                                 tokenizer_id=tokenizer_id,
-                                sequence_length=sequence_length, source=source)
+                                sequence_length=sequence_length, source=source,
+                                cross_document=False)
             packed = str(prefix)
         else:
             packed = str(out_dir / f"final-{name}-packed.jsonl")
@@ -162,8 +163,7 @@ def _proxy_documents(target_tokens: int, seed: int, proxy_vocabulary: int,
 
 def run_arm(name, *, shard, heldout, seed, use_muon, levers, model_config,
             steps, batch_size, sequence_length, device, precision, checkpoint_every,
-            grad_clip, ledger, run_dir, keep_checkpoints):
-    from src.eval.intrinsic import evaluate
+            grad_clip, ledger, run_dir, keep_checkpoints, compile_model=True):
     from src.train.reference import resumable_checkpoint, train
 
     out_dir = run_dir / name
@@ -178,7 +178,8 @@ def run_arm(name, *, shard, heldout, seed, use_muon, levers, model_config,
                    batch_size=batch_size, precision=precision, lr_schedule=True,
                    grad_clip=grad_clip, ledger_path=str(ledger), run_id=name,
                    resume=str(resume) if resume else None,
-                   keep_checkpoints=keep_checkpoints)
+                   keep_checkpoints=keep_checkpoints,
+                   compile_model=compile_model)
     wall_clock = time.perf_counter() - started
 
     # Build the capability curve from the ledger rather than re-evaluating every
@@ -248,6 +249,8 @@ def main() -> None:
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--checkpoint-every", type=int, default=500)
     parser.add_argument("--precision", default="auto")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                        help="torch.compile (default on); --no-compile disables")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--corpus-dir", default=str(ROOT / "data" / "final-v1"))
     parser.add_argument("--run-dir", default=str(ROOT / "runs" / "final"))
@@ -337,7 +340,8 @@ def main() -> None:
                   device=device, precision=args.precision,
                   checkpoint_every=args.checkpoint_every, grad_clip=args.grad_clip,
                   ledger=ledger, run_dir=run_dir,
-                  keep_checkpoints=args.keep_checkpoints)
+                  keep_checkpoints=args.keep_checkpoints,
+                  compile_model=args.compile)
 
     # Arms are run defensively. A single failure -- a genuinely diverged Muon
     # run, an out-of-memory, a session interruption -- must not throw away the

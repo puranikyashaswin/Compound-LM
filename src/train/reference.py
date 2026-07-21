@@ -221,6 +221,14 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
                             max_seq_len=rows.sequence_length)
     model.to(device)
 
+    # Single-doc shards can skip the per-step document-id sync and stay on the
+    # causal/flash attention path. Only trust an explicit False in binshard meta.
+    from src.model.document_attention import set_assume_single_document
+    single_doc = getattr(rows, "cross_document", True) is False
+    set_assume_single_document(model, single_doc)
+    if single_doc:
+        print("[systems] shard meta cross_document=False; assuming single-doc attention")
+
     # Systems lever: same mathematics, fewer seconds per step. Default fp32
     # preserves every result already in the ledger; speed is opt-in.
     policy = SystemsPolicy(precision=precision, compile=compile_model, device=device)
@@ -480,9 +488,9 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         batch_ids, batch_docs = rows.batch(data_position, batch_size)
         data_position = (data_position + batch_size) % len(rows)
 
-        ids = torch.tensor(batch_ids, dtype=torch.long, device=device)
+        ids = torch.as_tensor(batch_ids, dtype=torch.long, device=device)
         assert_token_ids_in_range(ids, vocab_size)
-        docs = torch.tensor(batch_docs, dtype=torch.long, device=device)
+        docs = torch.as_tensor(batch_docs, dtype=torch.long, device=device)
 
         if lr_schedule:
             # Both optimizers follow the same shape, each scaled from its own
@@ -609,9 +617,10 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
             eval_scores: dict = {}
             if heldout_shard:
                 from src.eval.intrinsic import evaluate
-                eval_scores = evaluate(str(checkpoint), heldout_shard, device=device,
+                eval_scores = evaluate(None, heldout_shard, device=device,
                                        batch_size=eval_batch_size,
-                                       max_batches=eval_max_batches)
+                                       max_batches=eval_max_batches,
+                                       model=model)
                 eval_scores["smoke"] = eval_scores["val_acc"]  # higher-is-better headline score
             
             tokens = (step + 1) * batch_size * rows.sequence_length
@@ -673,8 +682,8 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
     eval_scores = {}
     if heldout_shard:
         from src.eval.intrinsic import evaluate
-        eval_scores = evaluate(str(checkpoint), heldout_shard, device=device,
-                                     batch_size=eval_batch_size)
+        eval_scores = evaluate(None, heldout_shard, device=device,
+                                     batch_size=eval_batch_size, model=model)
         eval_scores["smoke"] = eval_scores["val_acc"]
         
     tokens = final_step * batch_size * rows.sequence_length

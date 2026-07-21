@@ -51,9 +51,16 @@ class BinLoader:
     def __len__(self) -> int:
         return len(self.shard)
 
+    @property
+    def cross_document(self) -> bool:
+        # Missing flag means legacy multi-doc packing.
+        return bool(self.shard.meta.get("cross_document", True))
+
     def batch(self, position: int, batch_size: int):
+        # Keep numpy arrays: the trainer converts with ``torch.as_tensor`` and
+        # avoids a Python-list round trip on every step.
         tokens, docs = self.shard.batch(range(position, position + batch_size))
-        return (tokens.tolist(), docs.tolist())
+        return tokens, docs
 
 
 def open_shard(shard: str | Path):

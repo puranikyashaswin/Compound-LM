@@ -40,9 +40,18 @@ def test_both_formats_carry_the_same_tokens(binary, jsonl):
     assert binary["heldout"]["tokens"] == jsonl["heldout"]["tokens"]
 
 
-def test_both_formats_pack_to_the_same_sequence_count(binary, jsonl):
-    assert len(open_shard(binary["train"]["packed"])) == \
-        len(open_shard(jsonl["train"]["packed"]))
+def test_binary_single_document_packing_uses_more_sequences_than_jsonl(binary, jsonl):
+    """Binary defaults to cross_document=False for the SDPA/flash path.
+
+    That pads short documents instead of concatenating them, so sequence count
+    rises while the real token count (pinned above) stays identical.
+    """
+    from src.data.binshard import PackedShard
+    bin_rows = len(open_shard(binary["train"]["packed"]))
+    jsonl_rows = len(open_shard(jsonl["train"]["packed"]))
+    assert bin_rows >= jsonl_rows
+    meta = PackedShard(binary["train"]["packed"]).meta
+    assert meta.get("cross_document") is False
 
 
 def test_shards_load_with_the_declared_sequence_length(binary):
@@ -55,9 +64,10 @@ def test_shards_load_with_the_declared_sequence_length(binary):
 
 def test_tokens_are_inside_the_declared_vocabulary(binary):
     """The fold must happen at preparation, not silently at training time."""
+    import numpy as np
     rows = open_shard(binary["train"]["packed"])
     ids, _ = rows.batch(0, min(8, len(rows)))
-    assert max(max(row) for row in ids) < CORPUS["vocab_size"]
+    assert int(np.max(ids)) < CORPUS["vocab_size"]
 
 
 def test_train_and_heldout_are_disjoint(binary):

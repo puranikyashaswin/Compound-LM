@@ -117,23 +117,56 @@ def grow_llama_depth(model, *, to_layers: int, mode: str = "zero_init"):
                                     function_preserving=(mode == "zero_init"))
 
 
+def prefer_sdpa_attention(model):
+    """Ask HuggingFace to use SDPA kernels when the install supports it.
+
+    Flash/SDPA are what make a 193M run finish in tens of hours rather than
+    ~100: the 4-D float document mask forces the eager path, which materialises
+    a full ``B·heads·S·S`` matrix per layer. Preferring SDPA here is free when
+    the forward later passes only a 2-D padding mask; with a 4-D mask transformers
+    still falls back, so this alone does not fix a packed multi-doc batch.
+    """
+    if torch is None or model is None:
+        return model
+    setter = getattr(model, "set_attn_implementation", None)
+    if callable(setter):
+        try:
+            setter("sdpa")
+        except Exception:
+            pass
+    return model
+
+
+def set_assume_single_document(model, enabled: bool) -> None:
+    """Propagate a packing hint so forwards can skip the per-step doc sync."""
+    from src.model.document_attention import set_assume_single_document as _set
+    _set(model, enabled)
+
+
 if torch is not None:
     class LlamaProtocolAdapter(nn.Module):
         """Give a Llama model this framework's forward contract.
 
         The trainer calls ``model(input_ids, document_ids)`` and expects logits.
-        ``document_ids`` carries the packing boundaries: several documents share
-        one sequence, and a token must not attend across a boundary. Llama's
-        default mask is purely causal, which would let the end of one document
-        read the one before it -- the exact leakage `src/data/packing.py` and its
-        validation exist to prevent. A 4-D additive mask is built here instead,
-        combining causality with document identity, and padding (negative
-        document ids) is excluded.
+        ``document_ids`` carries packing boundaries. Llama's default mask is
+        purely causal, which would leak across packed documents -- the exact
+        failure `src/data/packing.py` exists to prevent.
+
+        Two paths, and the difference is wall-clock:
+
+        * **Single-document sequences** (or padding-only tails): pass a 2-D
+          padding mask and let SDPA/flash run. This is the fast path that makes
+          Reex-1.5 finish near the original ~25 GPU-hour estimate.
+        * **Multi-document packed sequences**: build the 4-D document+causal
+          mask. That disables flash and is why an earlier Reex-1.5 config
+          projected ~99 hours; prefer packing with ``cross_document=False`` so
+          training stays on the fast path.
         """
 
         def __init__(self, model):
             super().__init__()
-            self.model = model
+            self.model = prefer_sdpa_attention(model)
+            self.assume_single_document = False
             config = model.config
             self.config = {
                 "architecture": "llama-hf",
@@ -156,6 +189,14 @@ if torch is not None:
         def forward(self, input_ids, document_ids=None):
             if document_ids is None:
                 return self.model(input_ids=input_ids).logits
+
+            from src.model.document_attention import is_single_document_batch
+
+            # Fast path: one document per row → 2-D pad mask keeps flash/SDPA.
+            if self.assume_single_document or is_single_document_batch(document_ids):
+                attention_mask = (document_ids >= 0).to(dtype=torch.long)
+                return self.model(input_ids=input_ids,
+                                  attention_mask=attention_mask).logits
 
             batch, length = input_ids.shape
             device = input_ids.device

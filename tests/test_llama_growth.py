@@ -10,7 +10,9 @@ import torch
 
 transformers = pytest.importorskip("transformers")
 
-from src.model.llama_adapter import (LlamaProtocolAdapter, grow_llama_depth)
+from src.model.llama_adapter import (LlamaProtocolAdapter, grow_llama_depth,
+                                     prefer_sdpa_attention, set_assume_single_document)
+from src.model.document_attention import is_single_document_batch
 
 
 def _tiny_reex(layers: int = 3):
@@ -107,6 +109,76 @@ def test_packing_mask_blocks_cross_document_attention():
         perturbed = adapter(perturbed_ids, documents)
     assert torch.equal(base[0, :8], perturbed[0, :8]), \
         "document 0 changed when document 1 was edited -- the packing mask leaks"
+
+
+def test_single_document_batch_detection_ignores_padding():
+    documents = torch.tensor([[3, 3, 3, -1], [1, 1, -1, -1]])
+    assert is_single_document_batch(documents)
+    mixed = torch.tensor([[3, 3, 4, -1], [1, 1, -1, -1]])
+    assert not is_single_document_batch(mixed)
+
+
+def test_assume_single_document_propagates_to_adapter():
+    adapter = LlamaProtocolAdapter(_tiny_reex()).eval()
+    set_assume_single_document(adapter, True)
+    assert adapter.assume_single_document is True
+    seen = {}
+
+    def capture_forward(*, input_ids=None, attention_mask=None, **kwargs):
+        seen["ndim"] = None if attention_mask is None else attention_mask.ndim
+        batch, length = input_ids.shape
+        return type("Out", (), {"logits": torch.zeros(batch, length, 512)})()
+
+    adapter.model.forward = capture_forward
+    ids = torch.randint(0, 512, (1, 8))
+    documents = torch.tensor([[0, 0, 0, 0, -1, -1, -1, -1]])
+    with torch.no_grad():
+        adapter(ids, documents)
+    assert seen["ndim"] == 2
+
+
+def test_single_document_forward_uses_2d_padding_mask():
+    """The fast path must hand HF a 2-D mask so SDPA/flash are not disabled."""
+    adapter = LlamaProtocolAdapter(_tiny_reex()).eval()
+    seen = {}
+
+    def capture_forward(*, input_ids=None, attention_mask=None, **kwargs):
+        seen["ndim"] = None if attention_mask is None else attention_mask.ndim
+        seen["mask"] = attention_mask
+        batch, length = input_ids.shape
+        return type("Out", (), {"logits": torch.zeros(batch, length, 512)})()
+
+    adapter.model.forward = capture_forward
+    ids = torch.randint(0, 512, (2, 8))
+    documents = torch.tensor([[0, 0, 0, 0, -1, -1, -1, -1],
+                              [2, 2, 2, 2, 2, -1, -1, -1]])
+    with torch.no_grad():
+        adapter(ids, documents)
+    assert seen["ndim"] == 2
+    assert torch.equal(seen["mask"], (documents >= 0).long())
+
+
+def test_multi_document_forward_still_builds_4d_mask():
+    adapter = LlamaProtocolAdapter(_tiny_reex()).eval()
+    seen = {}
+
+    def capture_forward(*, input_ids=None, attention_mask=None, **kwargs):
+        seen["ndim"] = None if attention_mask is None else attention_mask.ndim
+        batch, length = input_ids.shape
+        return type("Out", (), {"logits": torch.zeros(batch, length, 512)})()
+
+    adapter.model.forward = capture_forward
+    ids = torch.randint(0, 512, (1, 8))
+    documents = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]])
+    with torch.no_grad():
+        adapter(ids, documents)
+    assert seen["ndim"] == 4
+
+
+def test_prefer_sdpa_attention_is_best_effort():
+    model = _tiny_reex()
+    # Must not raise when the install has no SDPA setter / rejects the request.
+    assert prefer_sdpa_attention(model) is model
 
 
 def test_adapter_reports_grouped_query_heads():

@@ -141,7 +141,8 @@ def main() -> None:
     heldout_meta = write_packed_shard(
         take_tokens(documents, args.heldout_tokens, heldout_counter),
         out_dir / "heldout", sequence_length=args.sequence_length, vocab_size=vocab_size,
-        tokenizer_id=f"tiktoken-{args.encoding}", source=f"{args.dataset}:{args.config}")
+        tokenizer_id=f"tiktoken-{args.encoding}", source=f"{args.dataset}:{args.config}",
+        cross_document=False)
     print(f"heldout: {heldout_meta['real_tokens']:,} tokens, "
           f"{heldout_meta['n_documents']:,} docs, {heldout_meta['n_sequences']:,} sequences")
 
@@ -149,7 +150,8 @@ def main() -> None:
     train_meta = write_packed_shard(
         take_tokens(documents, target, train_counter),
         out_dir / "train", sequence_length=args.sequence_length, vocab_size=vocab_size,
-        tokenizer_id=f"tiktoken-{args.encoding}", source=f"{args.dataset}:{args.config}")
+        tokenizer_id=f"tiktoken-{args.encoding}", source=f"{args.dataset}:{args.config}",
+        cross_document=False)
     print(f"train:   {train_meta['real_tokens']:,} tokens, "
           f"{train_meta['n_documents']:,} docs, {train_meta['n_sequences']:,} sequences")
 

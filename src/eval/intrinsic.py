@@ -19,16 +19,20 @@ from src.model.reference import require_torch
 from src.train.reference import assert_token_ids_in_range
 
 
-def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu",
-             batch_size: int = 32, max_batches: int | None = None) -> dict[str, Any]:
+def evaluate(checkpoint: str | None, heldout_shard: str, *, device: str = "cpu",
+             batch_size: int = 32, max_batches: int | None = None,
+             model=None) -> dict[str, Any]:
     """Return intrinsic scores; higher ``val_acc`` is better.
 
     Held-out sequences are independent and the document mask is per-sequence,
     so batching changes throughput and nothing else -- ``batch_size`` must not
-    move any reported score (``tests/test_eval_batching.py`` pins that). It
-    defaults to 32 because this ran one sequence at a time, which leaves a GPU
-    almost entirely idle and made the scheduled evaluation a real fraction of
-    a run's wall clock.
+    move any reported score. It defaults to 32 because this ran one sequence at
+    a time, which leaves a GPU almost entirely idle and made the scheduled
+    evaluation a real fraction of a run's wall clock.
+
+    Pass ``model`` (already on ``device``) to score the resident training weights
+    without reloading a multi-GB checkpoint that also carries optimizer state.
+    ``checkpoint`` is required when ``model`` is omitted.
     """
     require_torch()
     import torch
@@ -36,18 +40,26 @@ def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu",
 
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if model is None and not checkpoint:
+        raise ValueError("evaluate requires checkpoint or model")
 
-    # Loaded to CPU first: a training checkpoint also carries the optimizer's
-    # moment tensors (2/3 of its bytes), and map_location=device would park
-    # those on the GPU for the whole evaluation next to the resident training
-    # model -- pure waste that at 193M params is ~1.5GB of headroom.
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    config = state["config"]
-    model = model_from_config(config)
-    model.load_state_dict(state["model"])
-    del state
-    model.to(device).eval()
-    vocab = config["vocab_size"]
+    owns_model = model is None
+    if owns_model:
+        # Loaded to CPU first: a training checkpoint also carries the optimizer's
+        # moment tensors (2/3 of its bytes), and map_location=device would park
+        # those on the GPU for the whole evaluation next to the resident training
+        # model -- pure waste that at 193M params is ~1.5GB of headroom.
+        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        config = state["config"]
+        model = model_from_config(config)
+        model.load_state_dict(state["model"])
+        del state
+        model.to(device).eval()
+        vocab = config["vocab_size"]
+    else:
+        vocab = int(model.config["vocab_size"])
+        was_training = model.training
+        model.eval()
 
     # Same loader the trainer uses, so a held-out score is measured against the
     # data it claims regardless of which shard format is on disk.
@@ -64,29 +76,33 @@ def evaluate(checkpoint: str, heldout_shard: str, *, device: str = "cpu",
     # 260K-token prefix already pins to ~3 decimal places. The cap always takes
     # the FIRST batches, so every checkpoint scores the identical subset.
     limit = len(rows) if max_batches is None else min(len(rows), max_batches * batch_size)
-    with torch.no_grad():
-        for index in range(0, limit, batch_size):
-            # Never wrap past the end: rows.batch is cyclic, so a final partial
-            # batch would silently re-score sequences from the start of the
-            # shard and weight them twice in the mean.
-            take = min(batch_size, limit - index)
-            batch_ids, batch_docs = rows.batch(index, take)
-            ids = torch.tensor(batch_ids, dtype=torch.long, device=device)
-            assert_token_ids_in_range(ids, vocab)
-            docs = torch.tensor(batch_docs, dtype=torch.long, device=device)
-            logits = model(ids, docs)
-            # Predict position t+1 from t; only score targets inside a real document.
-            pred_logits = logits[:, :-1].reshape(-1, vocab)
-            targets = ids[:, 1:].reshape(-1)
-            target_docs = docs[:, 1:].reshape(-1)
-            keep = target_docs >= 0
-            if keep.sum() == 0:
-                continue
-            pred_logits, targets = pred_logits[keep], targets[keep]
-            nll = torch.nn.functional.cross_entropy(pred_logits, targets, reduction="sum")
-            total_nll += float(nll)
-            total_correct += int((pred_logits.argmax(dim=-1) == targets).sum())
-            total_tokens += int(keep.sum())
+    try:
+        with torch.no_grad():
+            for index in range(0, limit, batch_size):
+                # Never wrap past the end: rows.batch is cyclic, so a final partial
+                # batch would silently re-score sequences from the start of the
+                # shard and weight them twice in the mean.
+                take = min(batch_size, limit - index)
+                batch_ids, batch_docs = rows.batch(index, take)
+                ids = torch.as_tensor(batch_ids, dtype=torch.long, device=device)
+                assert_token_ids_in_range(ids, vocab)
+                docs = torch.as_tensor(batch_docs, dtype=torch.long, device=device)
+                logits = model(ids, docs)
+                # Predict position t+1 from t; only score targets inside a real document.
+                pred_logits = logits[:, :-1].reshape(-1, vocab)
+                targets = ids[:, 1:].reshape(-1)
+                target_docs = docs[:, 1:].reshape(-1)
+                keep = target_docs >= 0
+                if keep.sum() == 0:
+                    continue
+                pred_logits, targets = pred_logits[keep], targets[keep]
+                nll = torch.nn.functional.cross_entropy(pred_logits, targets, reduction="sum")
+                total_nll += float(nll)
+                total_correct += int((pred_logits.argmax(dim=-1) == targets).sum())
+                total_tokens += int(keep.sum())
+    finally:
+        if not owns_model and was_training:
+            model.train()
 
     if total_tokens == 0:
         raise ValueError("no scorable held-out tokens")

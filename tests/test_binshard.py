@@ -77,6 +77,21 @@ def test_out_of_range_token_is_refused(tmp_path):
                            sequence_length=4, vocab_size=8, tokenizer_id="test")
 
 
+def test_single_document_packing_never_mixes_documents(tmp_path):
+    """cross_document=False pads each doc out so SDPA can stay on the 2-D path."""
+    write_packed_shard(DOCS, tmp_path / "s", sequence_length=4, vocab_size=64,
+                       tokenizer_id="test", cross_document=False)
+    shard = PackedShard(tmp_path / "s")
+    assert shard.meta["cross_document"] is False
+    docs = np.asarray(shard.docs)
+    for row in docs:
+        real = [d for d in row.tolist() if d != PAD_DOCUMENT_ID]
+        assert len(set(real)) <= 1, f"row mixes documents: {row.tolist()}"
+    # Doc a (5 toks) spans two seqs; b and c each get their own padded row.
+    assert len(shard) == 4
+    assert shard.meta["n_documents"] == 3
+
+
 def test_convert_jsonl_shard_round_trips(tmp_path):
     source = tmp_path / "docs.jsonl"
     source.write_text("\n".join(json.dumps(d) for d in DOCS) + "\n", encoding="utf-8")

@@ -28,6 +28,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -41,6 +42,51 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 REEX1 = "puranikyashaswinsharma/reex-1"
+
+# Single-document packing keeps every row free of document boundaries so the
+# Llama adapter can stay on the 2-D SDPA/flash path. Multi-doc rows force a
+# 4-D eager mask and were why Reex-1.5 projected ~99 GPU-hours instead of ~25.
+CROSS_DOCUMENT_PACKING = False
+
+
+def _corpus_allows_sdpa_fast_path(out_dir: Path) -> bool:
+    """True only when every shard was packed with ``cross_document=False``."""
+    metas = list(Path(out_dir).glob("*.meta.json"))
+    if not metas:
+        return False
+    for meta_path in metas:
+        try:
+            meta = json.loads(meta_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        # Older shards omit the flag; treat missing as multi-doc (the old default).
+        if meta.get("cross_document", True):
+            return False
+    return True
+
+
+def _invalidate_corpus(out_dir: Path) -> None:
+    """Drop a cached corpus so the next build cannot reuse an incompatible pack."""
+    out_dir = Path(out_dir)
+    if not out_dir.exists():
+        return
+    for path in out_dir.iterdir():
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+
+
+def _derive_total_steps(target_tokens: float, batch_size: int, seq_len: int,
+                        grad_accum: int, override: int | None) -> int:
+    tokens_per_step = batch_size * seq_len
+    total_steps = override if override is not None else int(target_tokens / tokens_per_step)
+    if total_steps % grad_accum:
+        # End the job on an optimizer boundary: a trailing partial accumulation
+        # window would run backward() without ever stepping -- wasted compute
+        # and a final checkpoint whose optimizer never saw its last micro-steps.
+        total_steps += grad_accum - total_steps % grad_accum
+    return total_steps
 
 
 def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
@@ -62,6 +108,10 @@ def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
     Held-out is taken as the FIRST `heldout_documents` documents and training
     from the rest, so the two are disjoint by construction and the split does
     not require knowing the corpus length in advance.
+
+    Packing is single-document (``cross_document=False``): short docs are padded
+    rather than concatenated, so training stays on SDPA/flash instead of the
+    eager 4-D document mask.
     """
     from datasets import load_dataset
     from transformers import AutoTokenizer
@@ -70,6 +120,9 @@ def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     marker = out_dir / "corpus.json"
+    if marker.exists() and not _corpus_allows_sdpa_fast_path(out_dir):
+        print("   local corpus packs multiple docs per sequence; rebuilding for SDPA")
+        _invalidate_corpus(out_dir)
     if marker.exists():
         print("   reusing corpus already built in this session")
         return json.loads(marker.read_text())
@@ -78,9 +131,12 @@ def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
     # identical corpus is rebuilt every time -- ~35 minutes each, four times.
     # Downloading the shards back costs a couple of minutes instead.
     if sync is not None and sync.pull_corpus(out_dir):
-        if marker.exists():
+        if marker.exists() and _corpus_allows_sdpa_fast_path(out_dir):
             print("   corpus restored from the Hub (skipped rebuild)")
             return json.loads(marker.read_text())
+        if marker.exists():
+            print("   Hub corpus packs multiple docs per sequence; rebuilding for SDPA")
+            _invalidate_corpus(out_dir)
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     counts = {"train": 0, "heldout": 0}
@@ -140,7 +196,8 @@ def build_corpus(out_dir: Path, *, target_tokens: int, skip_documents: int,
         prefix = out_dir / f"reex15-{which}-bin"
         write_packed_shard(source, prefix, sequence_length=sequence_length,
                            vocab_size=vocab_size, tokenizer_id="hf:gpt2",
-                           source="fineweb-edu")
+                           source="fineweb-edu",
+                           cross_document=CROSS_DOCUMENT_PACKING)
         shards[which] = {"packed": str(prefix), "tokens": counts[which]}
         print(f"   {which}: {counts[which]:,} tokens -> {prefix.name}")
 
@@ -197,12 +254,13 @@ def main() -> None:
                              "model and OOMs the T4.")
     parser.add_argument("--max-hours", type=float, default=8.0,
                         help="Stop and upload before the session limit kills the run")
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="MICRO-batch; the activation peak follows it. batch 8 x seq "
-                             "1024 needs 13.6GB and OOMs a 14.6GB T4; batch 4 needs 8.4GB "
-                             "and keeps the tensor cores fed far better than batch 2.")
-    parser.add_argument("--grad-accum", type=int, default=2,
-                        help="Micro-batches per optimizer step; batch 4 x accum 2 keeps "
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="MICRO-batch. With single-doc packing the adapter stays on "
+                             "SDPA/flash, so batch 8 x seq 1024 fits a 14.6GB T4; the old "
+                             "eager 4-D mask needed batch 4 to avoid OOM. Resuming an older "
+                             "checkpoint auto-matches its stored batch_size.")
+    parser.add_argument("--grad-accum", type=int, default=1,
+                        help="Micro-batches per optimizer step; batch 8 x accum 1 keeps "
                              "the effective batch at 8.")
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1.5e-4)
@@ -240,20 +298,7 @@ def main() -> None:
     print("=" * 72)
     print("REEX-1.5 -- resumable multi-session pretraining")
     print("=" * 72)
-    tokens_per_step = args.batch_size * args.seq_len
-    total_steps = args.total_steps or int(args.target_tokens / tokens_per_step)
-    if total_steps % args.grad_accum:
-        # End the job on an optimizer boundary: a trailing partial accumulation
-        # window would run backward() without ever stepping -- wasted compute
-        # and a final checkpoint whose optimizer never saw its last micro-steps.
-        total_steps += args.grad_accum - total_steps % args.grad_accum
-    args.total_steps = total_steps
-    effective_batch = args.batch_size * args.grad_accum
     print(f"device {device} | budget {args.max_hours:.1f}h this session")
-    print(f"  micro-batch {args.batch_size} x accum {args.grad_accum} "
-          f"= effective batch {effective_batch}")
-    print(f"  {tokens_per_step:,} tokens/micro-step x {total_steps:,} steps "
-          f"= {total_steps*tokens_per_step/1e9:.2f}B tokens")
 
     if args.checkpoint_every % args.grad_accum:
         # Checkpoints land on optimizer-step boundaries; a misaligned cadence
@@ -287,6 +332,22 @@ def main() -> None:
         from src.model.llama_adapter import LlamaProtocolAdapter
         state = torch.load(resume_path, map_location="cpu", weights_only=False)
         config = state["config"]
+        # train() refuses a mismatched batch_size; adopt the checkpoint's so a
+        # Hub resume of the pre-SDPA run (batch 4) does not die on the new default.
+        checkpoint_batch = state.get("batch_size")
+        if checkpoint_batch is not None and int(checkpoint_batch) != args.batch_size:
+            print(f"   resume checkpoint used batch_size={checkpoint_batch}; "
+                  f"matching it (CLI default was {args.batch_size})")
+            args.batch_size = int(checkpoint_batch)
+            # Pre-SDPA sessions used batch 4 x accum 2. Keep that effective
+            # batch when the new defaults (8 x 1) are what landed us here.
+            if args.batch_size == 4 and args.grad_accum == 1:
+                args.grad_accum = 2
+                print("   matching pre-SDPA grad_accum=2 for effective batch 8")
+                if args.checkpoint_every % args.grad_accum:
+                    raise SystemExit(
+                        f"--checkpoint-every {args.checkpoint_every} must be a "
+                        f"multiple of --grad-accum {args.grad_accum}")
         model = LlamaProtocolAdapter(LlamaForCausalLM(LlamaConfig(
             vocab_size=config["vocab_size"], hidden_size=config["d_model"],
             num_hidden_layers=config["n_layers"],
@@ -298,6 +359,19 @@ def main() -> None:
             rope_theta=config.get("rope_theta", 10000.0),
             tie_word_embeddings=True)))
         print(f"   continuing from step {resume_step:,}")
+
+    # Step count depends on micro-batch; derive after any resume batch adoption
+    # so the ETA and token budget describe the run that will actually execute.
+    override_steps = args.total_steps
+    total_steps = _derive_total_steps(
+        args.target_tokens, args.batch_size, args.seq_len, args.grad_accum, override_steps)
+    args.total_steps = total_steps
+    tokens_per_step = args.batch_size * args.seq_len
+    effective_batch = args.batch_size * args.grad_accum
+    print(f"  micro-batch {args.batch_size} x accum {args.grad_accum} "
+          f"= effective batch {effective_batch}")
+    print(f"  {tokens_per_step:,} tokens/micro-step x {total_steps:,} steps "
+          f"= {total_steps*tokens_per_step/1e9:.2f}B tokens")
 
     config = model.config
     params = sum({id(p): p.numel() for p in model.parameters()}.values())
@@ -352,8 +426,10 @@ def main() -> None:
 
     session_t0 = time.time()
     base_step = resume_step or 0
+    upload_thread: threading.Thread | None = None
 
     def on_checkpoint(step: int, checkpoint_path: Path) -> None:
+        nonlocal upload_thread
         # Throughput and ETA from measured progress -- the one number no
         # pre-flight audit could produce, printed as soon as it exists.
         done = step - base_step
@@ -363,16 +439,27 @@ def main() -> None:
             print(f"[eta] step {step:,}/{total_steps:,} | {rate:,.0f} tok/s | "
                   f"~{remaining_h:.1f} GPU-hours left "
                   f"(~{remaining_h / args.max_hours:.1f} more sessions)")
-        sync.push_resume_state(checkpoint_path, step=step)
+
+        # Overlap Hub network I/O with the next training window. Local snapshot
+        # work stays on this thread so weights cannot mutate mid-serialize.
+        if upload_thread is not None:
+            upload_thread.join()
+
+        milestone = None
         if args.milestone_every and step % args.milestone_every == 0:
             milestone = work / f"milestone-{step:08d}"
             model.model.save_pretrained(milestone)
-            sync.push_milestone(milestone, step=step)
-            # Local copy served its purpose either way; at 0.77GB apiece,
-            # keeping them would eat the session's disk before its time.
-            shutil.rmtree(milestone, ignore_errors=True)
-        if ledger.exists():
-            sync.push_file(ledger, "ledger/reex15-ledger.jsonl")
+
+        def push() -> None:
+            sync.push_resume_state(checkpoint_path, step=step)
+            if milestone is not None:
+                sync.push_milestone(milestone, step=step)
+                shutil.rmtree(milestone, ignore_errors=True)
+            if ledger.exists():
+                sync.push_file(ledger, "ledger/reex15-ledger.jsonl")
+
+        upload_thread = threading.Thread(target=push, name=f"hub-push-{step}", daemon=False)
+        upload_thread.start()
 
     from src.train.reference import train
 
@@ -386,6 +473,7 @@ def main() -> None:
         heldout_shard=shards["heldout"]["packed"], use_muon=args.use_muon,
         batch_size=args.batch_size, lr_schedule=True,
         warmup_fraction=args.warmup_fraction, precision=args.precision,
+        compile_model=True,
         grad_clip=args.grad_clip, keep_checkpoints=3, grad_accum=args.grad_accum,
         eval_batch_size=args.eval_batch_size, eval_max_batches=args.eval_max_batches,
         # fp16 GPU training is not bit-replayable: backward atomics reorder, so
@@ -398,6 +486,10 @@ def main() -> None:
         resume=str(resume_path) if resume_path else None,
         max_seconds=max(60.0, args.max_hours * 3600 - elapsed),
         on_checkpoint=on_checkpoint)
+
+    if upload_thread is not None:
+        upload_thread.join()
+        print("   hub uploads flushed")
 
     print("\n== 5. Session summary ==")
     print(f"   reached step  : {result['reached_step']:,} / {total_steps:,} "

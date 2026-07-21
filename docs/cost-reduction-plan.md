@@ -302,3 +302,14 @@ loudly if the loss curve diverges.
 4. **`torch.compile`** — measure before trusting; it can regress on short runs.
 5. **Muon** — already validated; keep it as the lever under test rather than
    folding it into the baseline.
+
+## systems-v2 defaults (unmeasured until re-probed)
+
+GPU entrypoints now default to `precision=auto`, `torch.compile` on
+(`--no-compile` disables), and new binary corpora use
+`cross_document=False` so attention can stay on the causal/flash path. Mid-run
+intrinsic eval scores the resident training weights instead of reloading the
+full checkpoint. **These are not a new verified multiplier** — re-run
+`scripts/verify_levers.py` / a Kaggle tok/s probe before updating the table
+above. Use `--precision fp32 --no-compile` to reproduce pre-systems-v2 ledger
+rows.

@@ -50,7 +50,8 @@ def _sha256_file(path: Path) -> str:
 def write_packed_shard(documents: Iterable[dict], out_prefix: str | Path, *,
                        sequence_length: int, vocab_size: int,
                        tokenizer_id: str, source: str = "unknown",
-                       drop_last_partial: bool = False) -> dict[str, Any]:
+                       drop_last_partial: bool = False,
+                       cross_document: bool = True) -> dict[str, Any]:
     """Greedily pack ``documents`` into fixed-length sequences on disk.
 
     Streams: never holds more than one sequence in memory, so the corpus may be
@@ -59,6 +60,12 @@ def write_packed_shard(documents: Iterable[dict], out_prefix: str | Path, *,
     ``sequence_length``, and every token carries its document's index so a
     trainer can build a block-diagonal mask. A trailing partial sequence is
     padded (``drop_last_partial`` discards it instead, for strict-variance runs).
+
+    ``cross_document=False`` refuses to put two documents in one sequence:
+    when a document ends mid-sequence the remainder is padded. That wastes a
+    little capacity on short documents, but keeps every row single-document so
+    the Llama adapter can stay on the flash/SDPA path instead of the eager 4-D
+    mask that turned a ~25h Reex-1.5 job into ~99h.
     """
     if sequence_length < 2:
         raise ValueError("sequence_length must be at least 2")
@@ -105,6 +112,11 @@ def write_packed_shard(documents: Iterable[dict], out_prefix: str | Path, *,
                     f"token id out of range for vocab_size={vocab_size} in "
                     f"document {document.get('document_id')}"
                 )
+            # Starting a new document: if cross-document packing is off and the
+            # buffer already holds tokens from the previous one, pad it out so
+            # the new document never shares a sequence with it.
+            if not cross_document and buffer_tokens:
+                flush(pad=True)
             document_index = n_documents
             n_documents += 1
             n_real_tokens += len(ids)
@@ -119,6 +131,10 @@ def write_packed_shard(documents: Iterable[dict], out_prefix: str | Path, *,
                 start += take
                 if len(buffer_tokens) == sequence_length:
                     flush(pad=False)
+            # End of this document: in single-doc mode, do not leave a partial
+            # buffer for the next document to fill -- pad now.
+            if not cross_document and buffer_tokens:
+                flush(pad=True)
         if not drop_last_partial:
             flush(pad=True)
     hash_file.close()
@@ -138,6 +154,7 @@ def write_packed_shard(documents: Iterable[dict], out_prefix: str | Path, *,
         "n_documents": n_documents,
         "real_tokens": n_real_tokens,
         "padding_tokens": n_pad_tokens,
+        "cross_document": cross_document,
         "attention_mode": "same_document_only",
         "tokens_sha256": _sha256_file(tokens_path),
         "docs_sha256": _sha256_file(docs_path),
@@ -146,6 +163,14 @@ def write_packed_shard(documents: Iterable[dict], out_prefix: str | Path, *,
     }
     meta["meta_sha256"] = sha256_bytes(json.dumps(meta, sort_keys=True).encode())
     prefix.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    if not cross_document:
+        total = meta["real_tokens"] + meta["padding_tokens"]
+        if total and meta["padding_tokens"] / total > 0.35:
+            # Single-doc packing buys flash/SDPA; extreme pad rates mean the
+            # job mostly trains on zeros. Callers should raise seq_len or filter.
+            print(f"[pack] WARNING: padding is {100 * meta['padding_tokens'] / total:.0f}% "
+                  f"of tokens under cross_document=False "
+                  f"({meta['padding_tokens']:,} pad / {meta['real_tokens']:,} real)")
     return meta
 
 
@@ -197,7 +222,8 @@ class PackedShard:
 
 def convert_jsonl_shard(jsonl_path: str | Path, out_prefix: str | Path, *,
                         vocab_size: int, tokenizer_id: str,
-                        sequence_length: int, source: str = "converted-jsonl") -> dict[str, Any]:
+                        sequence_length: int, source: str = "converted-jsonl",
+                        cross_document: bool = True) -> dict[str, Any]:
     """Convert a documents JSONL (pre-packing) into a binary packed shard."""
     def stream() -> Iterator[dict]:
         with Path(jsonl_path).open(encoding="utf-8") as handle:
@@ -206,4 +232,5 @@ def convert_jsonl_shard(jsonl_path: str | Path, out_prefix: str | Path, *,
                     yield json.loads(line)
 
     return write_packed_shard(stream(), out_prefix, sequence_length=sequence_length,
-                              vocab_size=vocab_size, tokenizer_id=tokenizer_id, source=source)
+                              vocab_size=vocab_size, tokenizer_id=tokenizer_id,
+                              source=source, cross_document=cross_document)

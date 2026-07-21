@@ -66,6 +66,8 @@ if torch is not None:
             self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
             self.out = nn.Linear(d_model, d_model, bias=False)
             self.rotary = RotaryEmbedding(self.head_dim, max_seq_len)
+            # Set by the trainer when the shard meta guarantees single-doc rows.
+            self.assume_single_document = False
 
         def forward(self, x: torch.Tensor, document_ids: torch.Tensor | None = None) -> torch.Tensor:
             b, t, c = x.shape
@@ -74,11 +76,10 @@ if torch is not None:
             k = k.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
             v = v.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
             q, k = self.rotary(q, k)
-            mask = torch.triu(torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1)
-            if document_ids is not None:
-                same = document_ids[:, None, :, None] == document_ids[:, None, None, :]
-                mask = mask[None, None, :, :] | ~same
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=~mask)
+            from src.model.document_attention import scaled_dot_product_attention_documented
+            assume = bool(getattr(self, "assume_single_document", False))
+            y = scaled_dot_product_attention_documented(
+                q, k, v, document_ids, assume_single_document=assume)
             return self.out(y.transpose(1, 2).contiguous().view(b, t, c))
 
 
