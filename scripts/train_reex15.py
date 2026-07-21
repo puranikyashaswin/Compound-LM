@@ -517,7 +517,10 @@ def main() -> None:
         model_override=model,
         resume=str(resume_path) if resume_path else None,
         max_seconds=max(60.0, args.max_hours * 3600 - elapsed),
-        on_checkpoint=on_checkpoint)
+        on_checkpoint=on_checkpoint,
+        # Kaggle workdirs and intentional SDPA corpus rebuilds change the
+        # absolute shard path while keeping the reex15-*-bin leaf name.
+        resume_shard_policy="same_name")
 
     if upload_thread is not None:
         upload_thread.join()

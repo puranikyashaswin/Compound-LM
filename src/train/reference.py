@@ -184,13 +184,19 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
           max_seconds: float | None = None,
           on_checkpoint=None, grad_accum: int = 1,
           eval_max_batches: int | None = None,
-          replay_tolerance: float = REPLAY_TOLERANCE) -> dict:
+          replay_tolerance: float = REPLAY_TOLERANCE,
+          resume_shard_policy: str = "strict") -> dict:
     require_torch()
     import torch
     from src.model.registry import build_model
     from src.data.contamination import assert_disjoint_shards
     from src.train.systems import (SystemsPolicy, apply_backend_flags, make_grad_scaler,
                                    maybe_compile, resolve_precision)
+
+    if resume_shard_policy not in ("strict", "same_name"):
+        raise ValueError(
+            f"resume_shard_policy must be 'strict' or 'same_name', got {resume_shard_policy!r}"
+        )
 
     # 1. Run automatic contamination check
     if heldout_shard:
@@ -361,10 +367,37 @@ def train(shard: str, output_dir: str, *, vocab_size: int = 32768,
         # The recorded loader provenance must match this call, or the resumed
         # curve would silently continue over different data than it began on.
         checkpoint_shard = state.get("shard")
-        if checkpoint_shard is not None and checkpoint_shard != str(Path(shard).resolve()):
-            raise ValueError(
-                f"resume checkpoint was trained on shard {checkpoint_shard}, not {Path(shard).resolve()}"
-            )
+        if checkpoint_shard is not None:
+            current = str(Path(shard).resolve())
+            recorded = str(Path(checkpoint_shard).resolve())
+            if recorded != current:
+                same_leaf = Path(recorded).name == Path(current).name
+                if resume_shard_policy == "strict" or not same_leaf:
+                    raise ValueError(
+                        f"resume checkpoint was trained on shard {checkpoint_shard}, "
+                        f"not {current}"
+                    )
+                # Kaggle sessions change absolute paths; Reex packing rebuilds
+                # keep the same leaf name. Prefer content identity when metas
+                # exist; otherwise rematerialize the data cursor.
+                print(f"[resume] shard path moved ({Path(recorded).name}); "
+                      f"accepting under resume_shard_policy=same_name")
+                old_meta = Path(checkpoint_shard).with_suffix(".meta.json")
+                new_meta = Path(shard).with_suffix(".meta.json")
+                same_bytes = False
+                if old_meta.exists() and new_meta.exists():
+                    try:
+                        old_hash = json.loads(old_meta.read_text()).get("tokens_sha256")
+                        new_hash = json.loads(new_meta.read_text()).get("tokens_sha256")
+                        same_bytes = bool(old_hash and old_hash == new_hash)
+                    except json.JSONDecodeError:
+                        same_bytes = False
+                if not same_bytes:
+                    # Packing/layout changed (e.g. multi-doc → single-doc SDPA).
+                    # Keep weights/optimizer; restart the cursor on the new shard.
+                    state["data_position"] = (int(state["step"]) * batch_size) % len(rows)
+                    print("[resume] shard bytes differ from the recorded path; "
+                          "resetting data_position on the new corpus")
         # Precision changes the numerics, so a resumed curve that switched
         # precision is not the curve it claims to continue.
         checkpoint_precision = state.get("precision")

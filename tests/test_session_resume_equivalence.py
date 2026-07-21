@@ -55,6 +55,21 @@ def test_resume_refuses_a_different_shard(tmp_path):
               resume=checkpoint, batch_size=2, **TRAIN_KWARGS)
 
 
+def test_resume_same_name_allows_relocated_shard(tmp_path):
+    """Kaggle workdir changes keep the leaf name; absolute paths must not hard-fail."""
+    from src.train.reference import train
+
+    shard = Path("data/toy-v1/toy-v1-packed.jsonl")
+    checkpoint = _checkpoint_at_step_6(tmp_path, str(shard))
+    relocated = tmp_path / "elsewhere" / shard.name
+    relocated.parent.mkdir(parents=True)
+    shutil.copy(shard, relocated)
+    result = train(str(relocated), str(tmp_path / "resumed"), steps=12,
+                   resume=checkpoint, batch_size=2,
+                   resume_shard_policy="same_name", **TRAIN_KWARGS)
+    assert result["reached_step"] == 12
+
+
 def test_resume_refuses_a_different_batch_size(tmp_path):
     """batch_size changes what data_position means, so it cannot silently differ."""
     from src.train.reference import train
