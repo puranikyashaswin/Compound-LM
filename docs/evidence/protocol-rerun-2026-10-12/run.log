@@ -1,0 +1,25 @@
+== 1. Build disjoint train / held-out shards ==
+   train tokens=512 heldout tokens=256
+   model params: reference-v1=738,144 reex-v2=725,664
+== 2. Two-seed baseline (A0/A1) ==
+   acc s17=0.9407 s23=0.9368 spread=0.0040
+== 3. Optimizer lever (Muon) ==
+   acc s17=0.9328 s23=0.9328
+== 4. Architecture lever (Reex-v2: RoPE + RMSNorm + SwiGLU) ==
+   acc s17=0.9130 s23=0.9209
+== 5. Compound arm (architecture + optimizer) ==
+   acc s17=0.8972 s23=0.8854
+== 6. Capability-at-cost — M(S) at common target ==
+   [warn] timing noise 23.5% between identical baseline seeds: wall-clock multipliers below are NOT reliable on this machine. FLOP multipliers are unaffected.
+   baseline-s17       flops=1.000× step_cost=1.00× wall_clock=1.000× overlap=1.000
+   baseline-s23       flops=0.927× step_cost=0.76× wall_clock=1.212× overlap=0.927
+   optimizer-s17      flops=1.819× step_cost=1.17× wall_clock=1.550× overlap=1.021
+   optimizer-s23      flops=1.781× step_cost=0.98× wall_clock=1.818× overlap=1.000
+   architecture-s17   flops=0.516× step_cost=0.76× wall_clock=0.683× overlap=1.028
+   architecture-s23   flops=0.502× step_cost=0.72× wall_clock=0.694× overlap=1.000
+   compound-s17       flops=1.451× step_cost=1.01× wall_clock=1.437× overlap=1.624
+   compound-s23       flops=1.452× step_cost=1.40× wall_clock=1.038× overlap=1.625
+
+Evidence package: outputs/protocol-report.json
+Baseline seed-spread gate (<=0.15): PASS
+PYTHONPATH=. OMP_NUM_THREADS=2 nice -n 10  scripts/run_protocol.py --out   57.08s user 9.09s system 80% cpu 1:22.24 total

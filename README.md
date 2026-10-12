@@ -4,11 +4,17 @@ An auditable experiment harness for measuring how language-model training effici
 
 The first implementation is the evidence spine: canonical configuration, provenance, append-only ledger, checkpoint health checks, deterministic smoke trainer, and automatic multiplier tables. Expensive model/data adapters are added only after these contracts pass.
 
-`scripts/run_protocol.py` runs the protocol end-to-end at toy scale on CPU: a two-seed baseline plus two levers — the Muon optimizer and the Reex-v2 architecture (RoPE + RMSNorm + SwiGLU, selected via `src/model/registry.py`, parameter-matched to the reference model within 2%) — each in isolation and then compounded, scored by held-out capability and compared by capability-at-cost with an overlap coefficient. The same protocol scales to the 200M baseline by swapping the corpus, config, and (on GPU) the E-v1 benchmark harness.
+`scripts/run_protocol.py` runs the protocol end-to-end at toy scale on CPU: a two-seed baseline plus two levers — the Muon optimizer and the Reex-v2 architecture (RoPE + RMSNorm + SwiGLU, selected via `src/model/registry.py`, parameter-matched to the reference model within 2%) — each in isolation and then compounded, scored by held-out capability and compared by capability-at-cost with an overlap coefficient. The protocol is designed to scale to the 200M baseline by swapping the corpus, config, and (on GPU) the E-v1 benchmark harness; no 200M run has been done yet.
 
 The toy corpus is 64 words arranged in a fixed cycle, so each word deterministically predicts its successor. Held-out documents are windows the model never trained on (the contamination gate passes honestly), but every word transition inside them appears in training — so held-out accuracy measures learned generalization of the successor rule, not memorization. On that signal, at this scale: the Muon optimizer lever reaches the common held-out target at **~1.8× less compute** than the AdamW baseline (seed noise band 0.07×); the Reex-v2 architecture lever alone is **slower** (~0.51×) on this corpus; and the compound arm (Reex-v2 + Muon) lands at **~1.45×** — an overlap coefficient of ~1.62, meaning Muon recovers far more of the architecture's toy-scale deficit than the independent product predicts. Per the build plan, an overlap above 1 triggers an audit before it is celebrated, and a toy-scale architecture result carries no weight for 200M either way — the cycle corpus rewards the reference model's learned absolute positions, which is exactly the kind of proxy artifact the re-measure-at-scale rule exists for.
 
 Toy scale is a proxy, not a prediction: these multipliers are re-measured at each real scale before they are trusted.
+
+### Scale status (audited 2026-10-12)
+
+- **Every multiplier in the table below is toy scale:** 738,144-parameter models on CPU, 512 training tokens and 256 held-out tokens from the 64-word cycle corpus. A re-run on 2026-10-12 reproduced the FLOP multipliers and overlap coefficients exactly; the evidence is in [docs/evidence/protocol-rerun-2026-10-12/](docs/evidence/protocol-rerun-2026-10-12/). Wall-clock multipliers stay suppressed because the two identical baseline seeds differed by 23.5% in step time on that machine.
+- **The one GPU run (Kaggle) does not resolve a lever effect.** Its common target score was 0.0029, the two baseline seeds differed by 1.37x in cost-to-target, and the report marks `clears_noise_band: false`.
+- **No result at 200M parameters, or at any real-data scale, exists yet.** The repo makes no claim that these levers compound at real scale.
 
 ### Corrections this instrument has made to its own results
 
